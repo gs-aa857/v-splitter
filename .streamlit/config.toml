@@ -1,0 +1,11 @@
+[server]
+# Uploads are held in memory; 200 MB is Streamlit's default and plenty for
+# a model output plus an import file.
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = false

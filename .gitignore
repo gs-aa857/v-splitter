@@ -1,0 +1,13 @@
+# Client data must never enter the repository
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+
+# Python clutter
+__pycache__/
+*.pyc
+.venv/
+
+# Streamlit secrets, if any are ever added
+.streamlit/secrets.toml
