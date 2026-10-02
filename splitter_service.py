@@ -42,6 +42,9 @@ import pandas as pd
 import config as CFG
 import mmm_splitter as M
 
+# Findings are worded for the app, not the command line.
+M.INTERFACE = "app"
+
 # Imported modules persist for the life of the server process (only the main
 # script is re-executed on each interaction), so this is one lock per process.
 _RUN_LOCK = threading.Lock()
@@ -138,6 +141,15 @@ def split(files, settings, apply: bool, dest_name: str | None = None) -> RunResu
         return M.cmd_split(_Args(paths["output"], paths["import"], apply, dest))
 
     return run_isolated(files, settings, go, keep=dest_name if apply else None)
+
+
+def diagnose(files, settings, which: str, pooled: str) -> RunResult:
+    """The two diagnostics the app offers, for one variable: which DATA
+    columns would close a gap in the sum, and whether a rolling average
+    explains a day-level mismatch."""
+    fn = {"sum": M.cmd_check_sum, "smoothing": M.cmd_check_smoothing}[which]
+    return run_isolated(files, settings,
+                        lambda p, _f: fn(p["output"], p["import"], pooled))
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +294,8 @@ def from_composite(pooled: str, composites: dict, data_cols: list[str],
                 f"Formula is an even-width centred average (cma, {n}). The "
                 f"platform weights its two end points by half; the tool's "
                 f"rolling mean does not, so smoothing was NOT pre-filled. "
-                f"Run check-smoothing before splitting this one.")
+                f"Use 'Was it smoothed before modelling?' under Diagnose this "
+                f"variable before splitting this one.")
         else:
             pf.smoothing = {"window": n, "centred": kind == "cma"}
         expr = inner

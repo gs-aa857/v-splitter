@@ -110,6 +110,16 @@ except SyntaxError as _err:
     sys.exit(1)
 
 
+# Who is reading the messages. The command line points people at commands and
+# config.py; the hosted app sets this to "app", and the same findings then
+# point at what the app offers instead (its settings, its Diagnose buttons).
+INTERFACE = "cli"
+
+
+def _hint(cli: str, app: str) -> str:
+    return app if INTERFACE == "app" else cli
+
+
 # The structure sheet name exactly as config.py states it. Inputs may switch
 # STRUCTURE_SHEET to an alternative for one file; every new Inputs starts again
 # from this, so one file's alternative never leaks into the next run.
@@ -1040,9 +1050,11 @@ class Inputs:
 
         if best is None:
             raise ValueError(
-                f"No date column found on the '{DATA_SHEET}' sheet. Set "
-                f"DATA_DATE_COL in config.py to the correct name.\n"
-                f"Columns found: {', '.join(self.data_columns[:12])}..."
+                f"No date column found on the '{DATA_SHEET}' sheet. "
+                + _hint("Set DATA_DATE_COL in config.py to the correct name.\n",
+                        "Send this to whoever maintains the tool; the date "
+                        "column name has to be set for this project.\n")
+                + f"Columns found: {', '.join(self.data_columns[:12])}..."
             )
         return best
 
@@ -1322,7 +1334,10 @@ def split_datasheet(
                     f"period, limit {MAX_RESCALE_DAY_SHARE:.0%})\n"
                     f"  {vol_gap:.2%} of volume (limit "
                     f"{MAX_RESCALE_VOLUME:.0%})\n"
-                    f"This looks like a missing component. Run check-sum.")
+                    f"This looks like a missing component. "
+                    + _hint("Run check-sum.",
+                            "Use 'Diagnose: which columns are missing?' for "
+                            "this variable."))
             factor = pd.Series(1.0, index=campaign_raw.index)
             live = off & (parts > 0)
             factor[live] = pooled_raw_series[live] / parts[live]
@@ -2715,12 +2730,11 @@ def split_curves(
         )
     idx = names.index(pooled_var)
     pooled = blocks[idx]
-    if pooled.borrows_global:
-        raise ValueError(
-            f"'{pooled_var}' is the first channel and borrows the global "
-            f"pressure/spend columns. Splitting it would require reassigning "
-            f"those columns to another channel -- not handled."
-        )
+    # The first channel has no pressure/spend columns of its own: it uses the
+    # sheet's shared pair (also the x-axis the summary rows fill). When it is
+    # the one split, the first campaign inherits that pair and every other
+    # campaign gets a full five-column block.
+    first_borrows = pooled.borrows_global
 
     if pooled_var not in lead_names:
         raise ValueError(
@@ -2731,7 +2745,8 @@ def split_curves(
     n_sum, n_curve = split_sections(sheet, len(leading))
     curve_rows = slice(n_sum, n_sum + n_curve)
 
-    p_pool = sheet.loc[curve_rows, pooled.cols["pressure"]].astype(float).values
+    p_pool = sheet.loc[curve_rows, gp if first_borrows else
+                       pooled.cols["pressure"]].astype(float).values
     r_pool = sheet.loc[curve_rows, pooled.cols["bare"]].astype(float).values
     valid = ~np.isnan(p_pool)
     n_pts = int(valid.sum())
@@ -2754,8 +2769,10 @@ def split_curves(
         print(f"    WARNING: cost per unit is 1.00 for every campaign, which "
               f"means this\n      variable was modelled on SPEND. Under "
               f"shared_shape the five curves\n      come out identical and "
-              f"overlapping, and do not sum to the pooled\n      curve. Set "
-              f"CURVE_MODE to \"additive\" for '{pooled_var}' -- see config.py.")
+              f"overlapping, and do not sum to the pooled\n      curve. "
+              + _hint(f"Set CURVE_MODE to \"own_curve\" for '{pooled_var}' -- "
+                      f"see config.py.",
+                      "Choose 'Own curve per campaign' for this variable."))
 
     # A campaign that has not run in the last 12 months gets no curve.
     #
@@ -2783,7 +2800,8 @@ def split_curves(
             f"No cost per unit could be derived for: {', '.join(zero_cost)}.\n"
             f"These campaigns have no spend in the import file at all, so their "
             f"response curves would sit on an all-zero spend axis. Check the "
-            f"spend columns named in config.py."
+            + _hint("spend columns named in config.py.",
+                    "spend columns chosen for them in step 2.")
         )
 
     # shared_shape: the pooled curve itself, with only the spend axis differing
@@ -2858,16 +2876,31 @@ def split_curves(
     if styled:
         lab.update(styled.labels)
     lab.pop("bare", None)
+    # Where each campaign's five series go. The first campaign of a split
+    # first channel writes its pressure/spend into the shared pair.
+    col_for = {}
+    for i, name in enumerate(active):
+        col_for[name] = {
+            "pressure": gp if (first_borrows and i == 0)
+            else f"{name}{lab['pressure']}",
+            "spend": gs if (first_borrows and i == 0)
+            else f"{name}{lab['spend']}",
+            "bare": name,
+            "Efficiency": f"{name}{lab['Efficiency']}",
+            "Marginal Efficiency": f"{name}{lab['Marginal Efficiency']}",
+        }
+    trigger = pooled.cols["bare"] if first_borrows else pooled.cols["pressure"]
     new_headers: list[str] = []
     for h in headers:
         if h in (pooled.cols.get(k) for k in
                  ("pressure", "spend", "bare", "Efficiency", "Marginal Efficiency")):
-            if h == pooled.cols["pressure"]:
-                for name in active:
-                    new_headers += [f"{name}{lab['pressure']}",
-                                    f"{name}{lab['spend']}", name,
-                                    f"{name}{lab['Efficiency']}",
-                                    f"{name}{lab['Marginal Efficiency']}"]
+            if h == trigger:
+                for i, name in enumerate(active):
+                    subs = (("bare", "Efficiency", "Marginal Efficiency")
+                            if first_borrows and i == 0 else
+                            ("pressure", "spend", "bare", "Efficiency",
+                             "Marginal Efficiency"))
+                    new_headers += [col_for[name][k] for k in subs]
             continue
         new_headers.append(h)
 
@@ -2904,17 +2937,13 @@ def split_curves(
             continue
         for sub, col in b.cols.items():
             out.loc[new_curve_rows, col] = sheet.loc[curve_rows, col].values
-    if blocks[0].borrows_global:
+    if blocks[0].borrows_global and not first_borrows:
         for col in (gp, gs):
             out.loc[new_curve_rows, col] = sheet.loc[curve_rows, col].values
 
     for name, c in built.items():
-        out.loc[new_curve_rows, f"{name}{lab['pressure']}"] = c["pressure"]
-        out.loc[new_curve_rows, f"{name}{lab['spend']}"] = c["spend"]
-        out.loc[new_curve_rows, name] = c["bare"]
-        out.loc[new_curve_rows, f"{name}{lab['Efficiency']}"] = c["Efficiency"]
-        out.loc[new_curve_rows, f"{name}{lab['Marginal Efficiency']}"] = \
-            c["Marginal Efficiency"]
+        for sub, col in col_for[name].items():
+            out.loc[new_curve_rows, col] = c[sub]
 
     # ---- checks ----------------------------------------------------------
     if mode == "own_curve":
@@ -3421,15 +3450,17 @@ def cmd_split(args) -> int:
             print(f"  These are the modelling software's own working sheets. "
                   f"Nothing we use\n  downstream reads them, so they are "
                   f"carried through unchanged and still\n  name the combined "
-                  f"variable. Listed in UNTOUCHED in config.py.")
+                  f"variable." + _hint(" Listed in UNTOUCHED in config.py.", ""))
 
         undecided = [h.sheet for h in hits if h.orientation != "not_found"
                      and h.sheet not in handled and h.sheet not in UNTOUCHED]
         if undecided:
             print(f"\nSTOPPED. '{split.pooled}' appears on sheet(s) this script "
                   f"does not know about: {', '.join(undecided)}.")
-            print("Either add handling for them, or add them to UNTOUCHED to "
-                  "record that leaving them alone is deliberate.")
+            print(_hint("Either add handling for them, or add them to UNTOUCHED "
+                        "to record that leaving them alone is deliberate.",
+                        "The tool needs a decision about that sheet before it "
+                        "can write a file. Send this to whoever maintains it."))
             return 1
 
         row = structure.set_index("Variable").loc[split.pooled]
@@ -3438,7 +3469,9 @@ def cmd_split(args) -> int:
                 print(f"\nSTOPPED. No '{needed}' column in "
                       f"'{STRUCTURE_SHEET}'.\nColumns found: "
                       f"{', '.join(map(str, row.index))}\n"
-                      f"Run:  python inspect_headers.py \"<your output file>\"")
+                      + _hint("Run:  python mmm_splitter.py headers "
+                              "\"<your output file>\"",
+                              "Send this to whoever maintains the tool."))
                 return 1
         stated, bracketed, how_read = parse_decay(row["Decay"])
         if stated is None:
@@ -3458,7 +3491,9 @@ def cmd_split(args) -> int:
                   f"gives a retention rate of {decay} -- not a valid carryover.\n"
                   f"With DECAY_IS_RETENTION="
                   f"{DECAY_IS_RETENTION}, that reading cannot be right.\n"
-                  f"Run:  python check_decay_convention.py \"<output file>\"")
+                  + _hint("Run:  python mmm_splitter.py check-decay "
+                          "\"<output file>\"",
+                          "Send this to whoever maintains the tool."))
             return 1
         lag = 0 if pd.isna(row["Lag"]) else int(row["Lag"])
         if not DECAY_IS_RETENTION:
@@ -3551,8 +3586,9 @@ def cmd_split(args) -> int:
                       f"(limit {MAX_ACCEPTED_DAY_IMPACT}%)\n  Refusing.")
                 failures.append(split.pooled)
                 continue
-            print(f"  ACCEPTED despite the failure, by explicit decision in "
-                  f"config.py:\n    \"{reason}\"\n"
+            print(f"  ACCEPTED despite the failure, by explicit decision"
+                  + _hint(" in config.py", " (override)") + f":\n"
+                  f"    \"{reason}\"\n"
                   f"    verified: campaign shares move at most {impact:.3f} pp, "
                   f"and {day_impact:.3f}% of\n    contribution shifts between "
                   f"days -- both within limits")
@@ -3660,7 +3696,8 @@ def cmd_split(args) -> int:
         if rs:
             print(f"  RESCALED TO THE POOLED FIGURE on {rs['days']} day(s) "
                   f"({rs['first']:%Y-%m-%d} to {rs['last']:%Y-%m-%d}),")
-            print(f"    by explicit decision in config.py:")
+            print(f"    by explicit decision"
+                  + _hint(" in config.py", " (override)") + ":")
             print(f"    \"{rs['reason']}\"")
             print(f"    On those days the pooled figure is taken as what the "
                   f"model used, and")
@@ -3686,7 +3723,8 @@ def cmd_split(args) -> int:
                   f"was done\n    to the pooled variable before modelling")
         note = r2.get("raw_mismatch_accepted")
         if note:
-            print(f"  RAW MISMATCH ACCEPTED, by explicit decision in config.py:")
+            print(f"  RAW MISMATCH ACCEPTED, by explicit decision"
+                  + _hint(" in config.py", " (override)") + ":")
             print(f"    \"{note['reason']}\"")
             print(f"    the pooled Raw differs from the campaign columns on "
                   f"{note['days_affected']} day(s)")
@@ -3772,9 +3810,9 @@ def cmd_split(args) -> int:
         print("      not the file; or")
         print("  (b) something is off in the model export.")
         print()
-        print("The 'best fit' figures above show what the contribution numbers")
+        print("The 'closest' figures above show what the contribution numbers")
         print("actually support. If that looks right, tell whoever maintains this")
-        print("script -- do not just overwrite the sheet.")
+        print("tool -- do not edit the file until the check passes.")
         print("=" * 72)
         return 1
 
@@ -3818,7 +3856,9 @@ def cmd_split(args) -> int:
         print("-" * 72)
 
     if not args.apply:
-        print("\nAll checks passed. Re-run with --apply to write the file.")
+        print("\nAll checks passed. " + _hint(
+            "Re-run with --apply to write the file.",
+            "Generate the file below when ready."))
         return 0
 
     try:
@@ -4479,7 +4519,8 @@ def cmd_check_smoothing(out_path: str, imp_path: str, pooled: str) -> int:
     print(f"\n  difference as a share of the total: {rel:.4%}")
     if rel > 0.01:
         print("  -> the totals differ by more than 1%, so this looks like a")
-        print("     MISSING COMPONENT rather than smoothing. Try check-sum.")
+        print("     MISSING COMPONENT rather than smoothing. " + _hint(
+            "Try check-sum.", "Try 'which columns are missing?'."))
     else:
         print("  -> the totals barely differ, so the same volume is present but")
         print("     spread differently across days. That is what smoothing does.")
@@ -4506,10 +4547,15 @@ def cmd_check_smoothing(out_path: str, imp_path: str, pooled: str) -> int:
     if w < 0.5:
         print(f"\n  FOUND IT: a {win}-day rolling average"
               f"{' (centred)' if cen else ''} reproduces the pooled series.")
-        print(f"\n  Add to config.py:")
-        print(f"      SMOOTHING = {{")
-        print(f"          \"{pooled}\": {{\"window\": {win}, "
-              f"\"centred\": {cen}}},")
+        if INTERFACE == "app":
+            print(f"\n  Enter {win} as this variable's smoothing window"
+                  f"{' and tick Centred' if cen else ''} in step 2, then run "
+                  f"the checks again.")
+        else:
+            print(f"\n  Add to config.py:")
+            print(f"      SMOOTHING = {{")
+            print(f"          \"{pooled}\": {{\"window\": {win}, "
+                  f"\"centred\": {cen}}},")
         print(f"      }}")
         print(f"\n  The same smoothing is then applied to each campaign, which")
         print(f"  makes them sum to the pooled series exactly -- a rolling average")
@@ -4630,8 +4676,10 @@ def cmd_check_sum(out_path: str, imp_path: str, pooled: str) -> int:
         print("\n  columns that would account for the shortfall:")
         for score, col, tag in best[:6]:
             print(f"      {col:<44} {tag}")
-        print("\n  Add the matching one to this Split in config.py as another")
-        print("  Campaign(...) entry, with its own spend column.")
+        print(_hint("\n  Add the matching one to this Split in config.py as "
+                    "another\n  Campaign(...) entry, with its own spend column.",
+                    "\n  Add the matching one as another row in this variable's "
+                    "table in step 2,\n  with its own spend column."))
 
         # If the pooled variable's NAME says a component is excluded but its Raw
         # includes it, then Raw is not what the model was fitted on -- and that
