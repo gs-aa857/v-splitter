@@ -88,7 +88,8 @@ def config_text(settings: dict) -> str:
            "# give it to whoever maintains the tool to repeat the run exactly.",
            ""]
     for k in ("DECAY_IS_RETENTION", "CURVE_MODE", "ACCEPT_TRANSFORM_MISMATCH",
-              "ACCEPT_RAW_MISMATCH", "SMOOTHING", "RESCALE_TO_POOLED"):
+              "ACCEPT_RAW_MISMATCH", "SMOOTHING", "RESCALE_TO_POOLED",
+              "COMPOSITE_COLUMNS"):
         out.append(f"{k} = {settings.get(k, S.CONFIG_DEFAULTS[k])!r}")
     out += ["", "SPLITS = ["]
     for sp in settings["SPLITS"]:
@@ -188,11 +189,11 @@ if ignored:
 st.header("2 · What to split")
 
 
-def get_prefill(pooled: str) -> S.Prefill:
+def get_prefill(pooled: str, expand: bool = False) -> S.Prefill:
     cache = st.session_state.prefills
-    if pooled not in cache:
-        cache[pooled] = S.prefill(pooled, ins)
-    return cache[pooled]
+    if (pooled, expand) not in cache:
+        cache[(pooled, expand)] = S.prefill(pooled, ins, expand_nested=expand)
+    return cache[(pooled, expand)]
 
 
 if model_composites:
@@ -221,11 +222,23 @@ selected = st.multiselect(
 
 splits: list[Split] = []
 curve_modes, smoothing, acc_transform, acc_raw, rescale = {}, {}, {}, {}, {}
+composite_cols: dict[str, list[str]] = {}
 problems: list[str] = []
 
 for pooled in selected:
-    pf = get_prefill(pooled)
-    ek = f"{file_key}::{pooled}"
+    ek0 = f"{file_key}::{pooled}"
+    nested = get_prefill(pooled).virtual or get_prefill(pooled, True).virtual \
+        or any("expanded into" in n for n in get_prefill(pooled, True).notes)
+    expand = False
+    if pooled in ins.composites and nested:
+        expand = st.checkbox(
+            f"Split the composites inside '{pooled}' all the way down to DATA "
+            f"columns", key=f"nest::{ek0}",
+            help="Off: a part that is itself a composite stays one campaign "
+                 "(the level it was combined at). On: it is taken apart into "
+                 "its own parts.")
+    pf = get_prefill(pooled, expand)
+    ek = f"{ek0}::{int(expand)}"
     with st.container(border=True):
         st.subheader(pooled)
         st.caption({
@@ -253,11 +266,13 @@ for pooled in selected:
                     help="Leave blank to use the metric column's name."),
                 "raw": st.column_config.SelectboxColumn(
                     "Column with the modelled metric",
-                    options=ranked(ins.data_cols, likely_raw),
+                    options=ranked(ins.data_cols,
+                                   list(pf.virtual) + likely_raw),
                     help="The impressions, clicks or GRPs the model was built on."),
                 "spend": st.column_config.SelectboxColumn(
                     "Column with spend",
-                    options=ranked(ins.data_cols, likely_spend)),
+                    options=ranked(ins.data_cols,
+                                   list(pf.virtual) + likely_spend)),
             })
 
         camps, bad = [], []
@@ -358,6 +373,10 @@ for pooled in selected:
 
     if camps:
         splits.append(Split(pooled=pooled, campaigns=camps))
+        for c in camps:
+            for col in (c.raw, c.spend):
+                if col in pf.virtual:
+                    composite_cols[col] = pf.virtual[col]
 
 build_only = not selected and not ins.has_curves and ins.can_build_curves
 if not selected and not build_only:
@@ -392,6 +411,7 @@ settings = {
     "ACCEPT_RAW_MISMATCH": acc_raw,
     "SMOOTHING": smoothing,
     "RESCALE_TO_POOLED": rescale,
+    "COMPOSITE_COLUMNS": composite_cols,
 }
 fingerprint = _digest(file_key, repr(settings))
 

@@ -55,13 +55,13 @@ _RUN_LOCK = threading.Lock()
 # file lacks 'T structure'), and that must not leak into the next run.
 _GLOBALS = ("SPLITS", "STRUCTURE_SHEET", "DECAY_IS_RETENTION", "CURVE_MODE",
             "ACCEPT_TRANSFORM_MISMATCH", "ACCEPT_RAW_MISMATCH", "SMOOTHING",
-            "RESCALE_TO_POOLED")
-CONFIG_DEFAULTS = {k: copy.deepcopy(getattr(CFG, k)) for k in _GLOBALS}
+            "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS")
+CONFIG_DEFAULTS = {k: copy.deepcopy(getattr(CFG, k, {})) for k in _GLOBALS}
 
 # Per-job settings the app now asks for itself. If config.py still carries
 # values for these they are ignored by the app, and the UI says so.
 PER_JOB = ("ACCEPT_TRANSFORM_MISMATCH", "ACCEPT_RAW_MISMATCH", "SMOOTHING",
-           "RESCALE_TO_POOLED")
+           "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS")
 
 SPEND_TOKENS = ("Inv", "Spend", "Cost")
 COMPOSITE_SHEET = "Composite data"
@@ -278,10 +278,28 @@ class Prefill:
     smoothing: dict | None = None
     notes: list[str] = field(default_factory=list)
     formula: str | None = None
+    # columns that are not on DATA but are built as sums of DATA columns:
+    # a nested composite kept whole as one campaign (and its spend)
+    virtual: dict[str, list[str]] = field(default_factory=dict)
+
+
+def _spend_name(part: str, taken) -> str:
+    ch, mt = split_name(part)
+    if mt in SPEND_TOKENS:
+        return part
+    alt = part.replace(f"_{mt}_", "_Inv_", 1) if mt else ""
+    return alt if alt and alt != part and alt not in taken else f"{part} spend"
 
 
 def from_composite(pooled: str, composites: dict, data_cols: list[str],
-                   _depth: int = 0, model_raw_cols=()) -> Prefill:
+                   _depth: int = 0, model_raw_cols=(),
+                   expand_nested: bool = False) -> Prefill:
+    """
+    Campaign rows from a composite's formula. A part that is itself a
+    composite is kept WHOLE by default -- one campaign, built as the sum of
+    its DATA columns -- because that is usually the level the composite was
+    made at. expand_nested=True takes it apart down to DATA columns.
+    """
     spec = composites[pooled]
     pf = Prefill(pooled, "composite", formula=spec["formula"])
     expr = spec["formula"].replace(" ", "")
@@ -315,9 +333,25 @@ def from_composite(pooled: str, composites: dict, data_cols: list[str],
                             "spend": guess_spend(part, data_cols)})
         elif part in composites and _depth < 5:
             sub = from_composite(part, composites, data_cols, _depth + 1,
-                                 model_raw_cols)
-            if sub.source == "composite" and not sub.smoothing:
+                                 model_raw_cols, expand_nested=True)
+            resolved = (sub.source == "composite" and not sub.smoothing
+                        and sub.rows and all(r["raw"] for r in sub.rows))
+            if resolved and not expand_nested:
+                taken = set(data_cols) | set(composites)
+                row = {"name": part, "raw": part, "spend": ""}
+                pf.virtual[part] = [r["raw"] for r in sub.rows]
+                if all(r["spend"] for r in sub.rows):
+                    sp = _spend_name(part, taken)
+                    row["spend"] = sp
+                    if sp != part:
+                        pf.virtual[sp] = [r["spend"] for r in sub.rows]
+                pf.rows.append(row)
+                pf.notes.append(f"'{part}' is itself a composite and is kept "
+                                f"whole: one campaign, the sum of its "
+                                f"{len(sub.rows)} DATA columns.")
+            elif resolved:
                 pf.rows += sub.rows
+                pf.virtual.update(sub.virtual)
                 pf.notes.append(f"'{part}' is itself a composite and was "
                                 f"expanded into its {len(sub.rows)} parts.")
                 pf.notes += [n for n in sub.notes
@@ -453,10 +487,11 @@ def inspect(files) -> RunResult:
     return run_isolated(files, {}, go)
 
 
-def prefill(pooled: str, ins: Inspection) -> Prefill:
+def prefill(pooled: str, ins: Inspection, expand_nested: bool = False) -> Prefill:
     if pooled in ins.composites:
         pf = from_composite(pooled, ins.composites, ins.data_cols,
-                            model_raw_cols=ins.model_raw_cols)
+                            model_raw_cols=ins.model_raw_cols,
+                            expand_nested=expand_nested)
         if pf.source != "none":
             return pf
         alt = from_sum_match(pooled, ins.pooled_raw.get(pooled), ins.data,

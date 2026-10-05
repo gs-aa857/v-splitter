@@ -52,6 +52,8 @@ try:
     import config as _config_module
     # Newer settings are read with a default, so an older config.py still runs.
     BUILD_MISSING_CURVES = getattr(_config_module, "BUILD_MISSING_CURVES", True)
+    CURVE_STEPS = int(getattr(_config_module, "CURVE_STEPS", 350))
+    COMPOSITE_COLUMNS = dict(getattr(_config_module, "COMPOSITE_COLUMNS", {}))
 except ImportError as _err:
     # An older config.py alongside a newer mmm_splitter.py. The two are a
     # matched pair; updating one without the other is the most common way this
@@ -118,6 +120,29 @@ INTERFACE = "cli"
 
 def _hint(cli: str, app: str) -> str:
     return app if INTERFACE == "app" else cli
+
+
+def add_composite_columns(data: pd.DataFrame, spec: dict) -> tuple[pd.DataFrame, dict]:
+    """
+    Columns a campaign can name that are not on DATA themselves: a composite
+    kept whole as one campaign (COMPOSITE_COLUMNS = {name: [DATA columns]}).
+    Each is the plain sum of its DATA columns, built here so that everything
+    downstream -- the sum check, the allocation, spends, curves -- treats it
+    like any other column. A real DATA column of the same name wins.
+    """
+    made = {}
+    data = data.copy()
+    for name, parts in (spec or {}).items():
+        if name in data.columns:
+            continue
+        missing = [p for p in parts if p not in data.columns]
+        if missing:
+            raise ValueError(f"'{name}' is to be built from DATA columns that "
+                             f"do not exist: {', '.join(missing)}")
+        data[name] = data[list(parts)].apply(pd.to_numeric, errors="coerce") \
+            .fillna(0.0).sum(axis=1)
+        made[name] = list(parts)
+    return data, made
 
 
 # The structure sheet name exactly as config.py states it. Inputs may switch
@@ -2044,7 +2069,9 @@ def split_contributions(
     pooled_var: str,
     campaign_names: list[str],
     tolerance: float = 1e-6,
+    sheet_name: str | None = None,
 ) -> tuple[pd.DataFrame, dict]:
+    sheet_label = sheet_name or CONTRIB_SHEET
     """
     contributions : the sheet, as read
     allocated     : per-campaign daily contribution from split_datasheet,
@@ -2052,7 +2079,7 @@ def split_contributions(
     """
     if pooled_var not in contributions.columns:
         raise ValueError(
-            f"'{pooled_var}' not a column in '{CONTRIB_SHEET}'. Variable columns "
+            f"'{pooled_var}' not a column in '{sheet_label}'. Variable columns "
             f"present: {[c for c in contributions.columns if c not in FIXED_COLS][:10]}..."
         )
     missing_names = [n for n in campaign_names if n not in allocated.columns]
@@ -2071,7 +2098,7 @@ def split_contributions(
     if gaps.any():
         first = contributions.loc[gaps.idxmax(), DATE_COL]
         raise ValueError(
-            f"{gaps.sum()} row(s) in '{CONTRIB_SHEET}' have no allocated "
+            f"{gaps.sum()} row(s) in '{sheet_label}' have no allocated "
             f"contribution -- first is {first:%Y-%m-%d}. This sheet's date range "
             f"differs from 'T datasheet variables'."
         )
@@ -2085,7 +2112,7 @@ def split_contributions(
     if diff.max() > tolerance:
         i = int(diff.argmax())
         raise ValueError(
-            f"'{pooled_var}' in '{CONTRIB_SHEET}' does not match the allocated "
+            f"'{pooled_var}' in '{sheet_label}' does not match the allocated "
             f"contribution.\n"
             f"  worst row: {contributions.iloc[i][DATE_COL]:%Y-%m-%d}\n"
             f"  this sheet {pooled_here[i]:,.4f}\n"
@@ -2104,7 +2131,7 @@ def split_contributions(
     contributions = contributions.drop(columns=[pooled_var])[new_order]
 
     report = {
-        "sheet": CONTRIB_SHEET,
+        "sheet": sheet_label,
         "pooled_column": pooled_var,
         "column_position": pos + 1,
         "columns": f"{len(new_order) - len(campaign_names) + 1} -> {len(new_order)}",
@@ -2124,25 +2151,68 @@ def split_contributions(
 WEEKLY_CONTRIB_SHEET = "Individual weekly contributions"
 
 
-def weekly_allocation(allocated: pd.DataFrame, week_starts) -> pd.DataFrame:
+def weekly_coverage(daily: pd.DataFrame, weekly: pd.DataFrame) -> list:
     """
-    Daily allocated contribution summed into the weekly sheet's own rows.
+    Which days each row of 'Individual weekly contributions' sums, read from
+    the two sheets rather than assumed.
 
-    Newer exports carry 'Individual weekly contributions': the daily figures
-    summed per week, each row dated by the first day of its week (the first
-    row is a part week starting on the model's first day). Each day goes to
-    the latest week start on or before it, so the weeks are taken from the
-    sheet rather than assumed to run Monday-Sunday.
+    Each row is dated by the first day of its week and runs to the day before
+    the next row's date. The LAST row is the one exports disagree on: one
+    version sums to the model's final day, another stops short and leaves the
+    final day or two out of the weekly sheet altogether. So its end is found
+    by trying each possible end date and keeping the one that reproduces that
+    row for every variable on both sheets. Every earlier week is checked the
+    same way. Returns [(start, end), ...] in the sheet's row order.
     """
-    starts = pd.DatetimeIndex(pd.to_datetime(week_starts)).sort_values()
-    days = pd.to_datetime(allocated[DATE_COL])
-    pos = np.searchsorted(starts.values, days.values, side="right") - 1
-    if (pos < 0).any():
-        raise ValueError(f"'{WEEKLY_CONTRIB_SHEET}' starts after the first "
-                         f"modelling day.")
-    out = allocated.drop(columns=[DATE_COL]).groupby(starts[pos].values).sum()
-    out.insert(0, DATE_COL, out.index)
-    return out.reset_index(drop=True)
+    d = daily.copy()
+    d[DATE_COL] = pd.to_datetime(d[DATE_COL])
+    d = d.sort_values(DATE_COL)
+    starts = list(pd.to_datetime(weekly[DATE_COL]))
+    cols = [c for c in weekly.columns if c in d.columns and c not in FIXED_COLS
+            and pd.api.types.is_numeric_dtype(weekly[c])
+            and pd.api.types.is_numeric_dtype(d[c])]
+    W = weekly[cols].to_numpy(dtype=float)
+    scale = max(float(np.nanmax(np.abs(W))) if W.size else 0.0, 1.0)
+    tol = 1e-9 * scale + 1e-6
+
+    def summed(a, b):
+        m = (d[DATE_COL] >= a) & (d[DATE_COL] <= b)
+        return d.loc[m, cols].to_numpy(dtype=float).sum(axis=0)
+
+    out = []
+    for i, a in enumerate(starts):
+        if i + 1 < len(starts):
+            b = starts[i + 1] - pd.Timedelta(days=1)
+            ends = [b]
+        else:
+            ends = [x for x in d[DATE_COL] if x >= a][::-1]   # longest first
+        hit = next((b for b in ends
+                    if np.nanmax(np.abs(summed(a, b) - W[i])) <= tol), None)
+        if hit is None:
+            raise ValueError(
+                f"'{WEEKLY_CONTRIB_SHEET}': the week starting {a:%Y-%m-%d} is "
+                f"not the sum of any run of days on '{CONTRIB_SHEET}', so its "
+                f"rows cannot be split from the daily figures.")
+        out.append((a, hit))
+    return out
+
+
+def weekly_allocation(allocated: pd.DataFrame, coverage: list) -> pd.DataFrame:
+    """
+    Daily allocated contribution summed into the weekly sheet's own rows,
+    using the day ranges weekly_coverage found. Days the weekly sheet leaves
+    out are left out here too.
+    """
+    days = pd.to_datetime(allocated[DATE_COL]).to_numpy()
+    rows = []
+    for a, b in coverage:
+        m = (days >= np.datetime64(a)) & (days <= np.datetime64(b))
+        r = allocated.loc[m].drop(columns=[DATE_COL]).sum()
+        r[DATE_COL] = a
+        rows.append(r)
+    out = pd.DataFrame(rows)
+    return out[[DATE_COL] + [c for c in out.columns if c != DATE_COL]] \
+        .reset_index(drop=True)
 
 
 # ==========================================================================
@@ -2204,10 +2274,14 @@ def _is_fixed(h: str) -> bool:
 def global_columns(headers: list[str]) -> tuple[str, str]:
     """The shared pressure and spend headers, as this file spells them."""
     gp = next((h for h in headers if str(h).strip().casefold() == "pressure"),
-              GLOBAL_PRESSURE)
+              None)
     gs = next((h for h in headers if str(h).strip().casefold() == "spend"),
-              GLOBAL_SPEND)
-    return gp, gs
+              None)
+    if (gp is None or gs is None) and len(headers) > 3 and \
+            [str(h).strip().casefold() for h in headers[:2]] == ["product", "market"]:
+        # Labels not recognisable: the shared pair is columns 3 and 4.
+        gp, gs = gp or headers[2], gs or headers[3]
+    return gp or GLOBAL_PRESSURE, gs or GLOBAL_SPEND
 SUMMARY_COLS = ["Average", "Maximum", "Diminishing Point"]
 GLOBAL_PRESSURE, GLOBAL_SPEND = " pressure", " spend"
 
@@ -2227,8 +2301,73 @@ class Block:
         return "pressure" not in self.cols
 
 
+# Variable names known to be on the curve sheet: the model's own, plus the
+# campaigns a run is about to add. Set by cmd_split; lets parse_blocks fall
+# back to reading blocks by position when the labels are not recognisable.
+KNOWN_VARIABLES: set[str] = set()
+
+
+def _positional_blocks(headers: list[str], known: set[str]) -> list[Block] | None:
+    """
+    Blocks read by position: each channel is five consecutive columns,
+    pressure, spend, the bare KPI column (named exactly as the variable),
+    Efficiency, Marginal Efficiency; the first channel's pressure/spend are
+    the sheet's shared pair. Anchored on the bare columns, so it does not
+    care how the labels are spelled -- including exports or anonymised copies
+    where they are tokens. None if the layout does not fit exactly.
+    """
+    known_s = {k.strip() for k in known}
+    bare = [i for i, h in enumerate(headers) if str(h).strip() in known_s]
+    if not bare or [str(h).strip().casefold() for h in headers[:2]] != \
+            ["product", "market"]:
+        return None
+    covered = set()
+    blocks = []
+    for k, j in enumerate(bare):
+        if j - 2 < 2 or j + 2 >= len(headers):
+            return None
+        name = headers[j]
+        subs = ("pressure", "spend", "bare", "Efficiency", "Marginal Efficiency")
+        b = Block(name, first_col=j, last_col=j + 2)
+        for off, sub in zip(range(-2, 3), subs):
+            h = headers[j + off]
+            if k == 0 and off < 0:
+                continue                       # the shared pair
+            b.cols[sub] = h
+            if str(h).startswith(name):
+                b.labels[sub] = h[len(name):]
+            covered.add(j + off)
+        if k > 0:
+            b.first_col = j - 2
+        blocks.append(b)
+    covered |= {0, 1, bare[0] - 2, bare[0] - 1}
+    rest = {i for i, h in enumerate(headers) if h not in SUMMARY_COLS}
+    if rest != covered or len(covered) != 4 + 5 * len(blocks) - 2:
+        return None
+    return blocks
+
+
 def parse_blocks(headers: list[str]) -> list[Block]:
-    """Group the variable columns into channel blocks, preserving order."""
+    """Group the variable columns into channel blocks, preserving order.
+
+    By label suffix first. If that leaves blocks that are not variables, or
+    variables without their five columns, and the variable names are known,
+    read the blocks by position instead (see _positional_blocks)."""
+    by_label = _parse_blocks_by_label(headers)
+    if not KNOWN_VARIABLES:
+        return by_label
+    known_s = {k.strip() for k in KNOWN_VARIABLES}
+    clean = all(b.name.strip() in known_s and
+                {"bare", "Efficiency", "Marginal Efficiency"} <= set(b.cols)
+                for b in by_label)
+    if clean:
+        return by_label
+    by_position = _positional_blocks(headers, KNOWN_VARIABLES)
+    return by_position if by_position is not None else by_label
+
+
+def _parse_blocks_by_label(headers: list[str]) -> list[Block]:
+    """Group the variable columns into channel blocks by label suffix."""
     blocks: dict[str, Block] = {}
     order: list[str] = []
     for i, h in enumerate(headers):
@@ -2369,7 +2508,8 @@ mmm_response_curves.py, which reproduces the vendor's sheets to 1e-15):
     cost_t    '(COSTS DEF)', the KPI's unit value, PER PERIOD
     f         lag -> adstock (recency kernels recovered exactly) -> curve
 
-Grid: 351 points from 0 to twice the window maximum ('100%'). Unit cost: mean
+Grid: CURVE_STEPS + 1 points (config; 351 by default, as the platform) from 0
+to twice the window maximum ('100%'). Unit cost: mean
 non-zero spend over mean non-zero volume. Markers: Average at x_bar, Maximum
 at the window maximum, Diminishing Point at the grid point of highest ROI (0
 when that is the first defined point). Variables: paid media ('M-'), in
@@ -2378,7 +2518,8 @@ first checked against its own contribution; one that does not rebuild exactly
 gets no curve, rather than a curve from parameters that are not the model's.
 """
 
-CURVE_STEPS = 350
+# CURVE_STEPS comes from config.py (default 350, the platform's default): the
+# number of steps in the curve grid of a built sheet.
 CURVE_LENGTH = 2.0                 # '100%': the grid ends at 2 x window max
 MEDIA_PREFIX = "M-"
 
@@ -2525,8 +2666,10 @@ def build_curve_sheets(structure: pd.DataFrame, datasheet: pd.DataFrame,
     cols = ["Product", "Market"]
     for i, c in enumerate(curves):
         n = c["name"]
+        # As platform 0.6.0 spells them: the shared pair 'pressure'/'Spend',
+        # every other channel '<name> pressure'/'<name> spend'.
         cols += (["pressure", "Spend"] if i == 0 else
-                 [f"{n} pressure", f"{n} Spend"])
+                 [f"{n} pressure", f"{n} spend"])
         cols += [n, f"{n} Efficiency", f"{n} Marginal Efficiency"]
     cols += SUMMARY_COLS
     rows = []
@@ -3028,6 +3171,31 @@ def _row_styles(ws, row_idx: int, n_cols: int) -> list[dict]:
     return out
 
 
+def _platform_curve_format(ws, sheet_name: str) -> None:
+    """
+    The curve sheets cell for cell as the platform writes them, so whatever
+    reads the platform's file reads ours the same way:
+
+      * every cell of the table exists; an empty one is an empty text cell,
+        not a missing cell (the platform writes the whole grid)
+      * 'Response Curves': header cells wrap text, column A is 9.14 wide
+      * 'T ROI curves': yellow sheet tab, panes frozen at C2
+    """
+    from openpyxl.styles import Alignment
+    n_rows, n_cols = ws.max_row, ws.max_column
+    for row in ws.iter_rows(min_row=2, max_row=n_rows, max_col=n_cols):
+        for cell in row:
+            if cell.value is None:
+                cell.value = ""
+    if sheet_name == CURVES_SHEET:
+        for cell in ws[1]:
+            cell.alignment = Alignment(wrap_text=True)
+        ws.column_dimensions["A"].width = 9.140625
+    else:
+        ws.sheet_properties.tabColor = "FFFFFF00"
+        ws.freeze_panes = "C2"
+
+
 def _write_sheet(wb, sheet_name: str, df: pd.DataFrame,
                  style_from_row: int = 2, header_row: int = 1,
                  allow_column_change: bool = False) -> None:
@@ -3141,6 +3309,8 @@ def write_output(
             ws = wb.create_sheet(name, idx)
             for c, h in enumerate(updates[name].columns, start=1):
                 ws.cell(row=1, column=c, value=str(h))
+            if name == ROI_CURVES_SHEET:
+                ws.freeze_panes = "C2"             # as the platform writes it
         missing = [n for n in updates if n not in wb.sheetnames]
         if missing:
             raise ValueError(
@@ -3151,6 +3321,8 @@ def write_output(
             _write_sheet(wb, name, df,
                          header_row=header_rows.get(name, 1),
                          allow_column_change=name in column_change_sheets)
+            if name in (CURVES_SHEET, ROI_CURVES_SHEET):
+                _platform_curve_format(wb[name], name)
         wb.save(tmp_path)
 
         # The written file must actually differ from the source. If it does
@@ -3182,6 +3354,11 @@ def write_output(
     return dest_path
 
 
+def _trim_empty_tail(df: pd.DataFrame) -> pd.DataFrame:
+    filled = np.where(df.notna().any(axis=1).to_numpy())[0]
+    return df.iloc[: (filled[-1] + 1) if len(filled) else 0]
+
+
 def verify_written(dest_path: Path, source_path: Path,
                    updates: dict[str, pd.DataFrame]) -> dict:
     """Read the written file back and confirm it matches what we intended."""
@@ -3201,6 +3378,11 @@ def verify_written(dest_path: Path, source_path: Path,
             entry["status"] = "untouched"
             o = original.get(name)
             n = written[name]
+            # An empty row at the very end can be counted in one file and
+            # not the other (a formatted-but-empty row is not saved back).
+            # It holds nothing, so compare without trailing empty rows.
+            if o is not None:
+                o, n = _trim_empty_tail(o), _trim_empty_tail(n)
             if o is None:
                 entry["identical_to_source"] = False
             elif o.equals(n):
@@ -3229,8 +3411,38 @@ def verify_written(dest_path: Path, source_path: Path,
                     True if same else False)
                 if same:
                     entry["note"] = "values match to 1e-12; float repr differs"
+                else:
+                    # pandas streams a sheet as its XML rows are stored, and
+                    # some exports store rows in an order that reads back
+                    # differently once the file is re-saved in order. Judge
+                    # by the cells themselves before calling it changed.
+                    if _cells_identical(source_path, dest_path, name):
+                        entry["identical_to_source"] = True
+                        entry["note"] = "cells identical; source rows stored out of order"
         result["sheets"][name] = entry
     return result
+
+
+def _cells_identical(source_path, dest_path, sheet: str) -> bool:
+    from openpyxl import load_workbook
+    try:
+        a = load_workbook(source_path)[sheet]
+        b = load_workbook(dest_path)[sheet]
+    except Exception:                                 # noqa: BLE001
+        return False
+    ra = [list(r) for r in a.iter_rows(values_only=True)]
+    rb = [list(r) for r in b.iter_rows(values_only=True)]
+    if len(ra) != len(rb):
+        return False
+    for x, y in zip(ra, rb):
+        for u, v in zip(x, y):
+            if u == v:
+                continue
+            if isinstance(u, (int, float)) and isinstance(v, (int, float)) \
+                    and np.isclose(u, v, rtol=1e-12, atol=1e-12):
+                continue
+            return False
+    return True
 
 
 # A hand adjustment covers a few days. Beyond these bounds it is something
@@ -3317,6 +3529,9 @@ def cmd_split(args) -> int:
           f"{', '.join(s.pooled for s in SPLITS)}\n")
 
     inp = load_inputs(args.output_file, args.import_file)
+    global KNOWN_VARIABLES
+    KNOWN_VARIABLES = {str(v) for v in inp.model_variables} | \
+        {c.name for sp in SPLITS for c in sp.campaigns}
     data = inp.data()
     date_col = inp.date_column()
     # Import files often carry a units row under the header ('Amount',
@@ -3329,6 +3544,13 @@ def cmd_split(args) -> int:
         print(f"  {int((~dated).sum())} row(s) on '{DATA_SHEET}' have no date "
               f"(a units row, say) and are ignored")
         data = data[dated].reset_index(drop=True)
+    try:
+        data, made = add_composite_columns(data, COMPOSITE_COLUMNS)
+    except ValueError as e:
+        print(f"\nSTOPPED. {e}")
+        return 1
+    for name, parts in made.items():
+        print(f"  '{name}' kept whole: the sum of {len(parts)} DATA column(s)")
 
     # Excel columns often arrive as text -- blanks typed as "-", numbers with a
     # comma decimal separator, stray notes in a cell. Summing those concatenates
@@ -3372,6 +3594,7 @@ def cmd_split(args) -> int:
     hdr_ic = find_header_row(args.output_file, CONTRIB_SHEET)
     contribs, ic_back = canon_cols(
         pd.read_excel(args.output_file, sheet_name=CONTRIB_SHEET, header=hdr_ic))
+    contribs_source = contribs.copy()
     # Newer exports may carry no curve sheets at all. Then there is nothing to
     # split there, which is said once rather than treated as an error.
     curves = (pd.read_excel(args.output_file, sheet_name=CURVES_SHEET)
@@ -3432,7 +3655,7 @@ def cmd_split(args) -> int:
 
     for split in SPLITS:
         print(f"\n{'#' * 72}\n# {split.pooled} -> {', '.join(split.names)}\n{'#' * 72}")
-        split.validate(inp.data_columns)
+        split.validate(list(data.columns))
         hits = scan_workbook(args.output_file, split.pooled)
         print(scan_report(args.output_file, split.pooled,
                                 handled=handled, skipped=UNTOUCHED))
@@ -3643,9 +3866,16 @@ def cmd_split(args) -> int:
         contribs, r6 = split_contributions(
             contribs, allocated, split.pooled, split.names)
         if weekly is not None and split.pooled in weekly.columns:
+            if "week_cov" not in locals():
+                week_cov = weekly_coverage(contribs_source, weekly)
+                last = week_cov[-1][1]
+                if last < pd.to_datetime(contribs_source[DATE_COL]).max():
+                    print(f"  NOTE: '{WEEKLY_CONTRIB_SHEET}' stops at "
+                          f"{last:%Y-%m-%d}; the export leaves the final "
+                          f"day(s) out of it, so the split does too.")
             weekly, r6w = split_contributions(
-                weekly, weekly_allocation(allocated, weekly[DATE_COL]),
-                split.pooled, split.names)
+                weekly, weekly_allocation(allocated, week_cov),
+                split.pooled, split.names, sheet_name=WEEKLY_CONTRIB_SHEET)
             print(f"  '{WEEKLY_CONTRIB_SHEET}' {r6w['rows']} weeks, contribution "
                   f"{r6w['pooled_contribution_total']:,.2f} -> "
                   f"{r6w['split_contribution_total']:,.2f}  (max row diff "
@@ -4467,6 +4697,7 @@ def cmd_check_smoothing(out_path: str, imp_path: str, pooled: str) -> int:
     ds.columns = [str(c).strip() for c in ds.columns]
     data = pd.read_excel(imp_path, sheet_name=DATA_SHEET)
     data.columns = [str(c).strip() for c in data.columns]
+    data, _ = add_composite_columns(data, COMPOSITE_COLUMNS)
 
     block = ds[ds["Variable"] == pooled].copy()
     if block.empty:
@@ -4589,6 +4820,7 @@ def cmd_check_sum(out_path: str, imp_path: str, pooled: str) -> int:
     ds.columns = [str(c).strip() for c in ds.columns]
     data = pd.read_excel(imp_path, sheet_name=DATA_SHEET)
     data.columns = [str(c).strip() for c in data.columns]
+    data, _ = add_composite_columns(data, COMPOSITE_COLUMNS)
 
     block = ds[ds["Variable"] == pooled].copy()
     if block.empty:

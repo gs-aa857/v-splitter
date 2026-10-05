@@ -193,6 +193,22 @@ CURVE_MODE = "own_curve"
 # the output file. With nothing to split, a run then only adds those sheets.
 BUILD_MISSING_CURVES = True
 
+# Steps in the grid of a BUILT curve: 350 gives 351 points from zero to twice
+# the window maximum, the platform's default. (It can also write e.g. 20.)
+# Only affects curve sheets the tool builds; existing sheets keep their own
+# grid when split.
+CURVE_STEPS = 350
+
+
+# Campaign columns that are not on DATA themselves but the plain sum of DATA
+# columns -- a composite inside a combined variable, kept whole as one
+# campaign. The app fills this in; from the command line:
+#
+#     COMPOSITE_COLUMNS = {
+#         "M-Channel_Inv_Campaign2": ["M-Channel_Inv_Part1", "M-Channel_Inv_Part2"],
+#     }
+COMPOSITE_COLUMNS: dict[str, list[str]] = {}
+
 # CURVE_MODE can also be set per variable, which matters when a model mixes
 # volume-based and spend-based pooled variables:
 #
