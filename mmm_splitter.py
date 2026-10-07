@@ -1621,12 +1621,31 @@ def detect_ratio(structure: pd.DataFrame, datasheet: pd.DataFrame, col: str,
 DATE_COL = "Period name"
 
 
+def window_start(dates, end=None) -> pd.Timestamp:
+    """
+    First period of the trailing year that ends at `end`, counted in the
+    data's own periods, as the platform counts it: 365 days for a daily
+    model, the last 52 weeks (the final week included) for a weekly one, 12
+    months for a monthly one. Used for the curve window and every "last 12
+    months" figure.
+    """
+    u = pd.DatetimeIndex(pd.to_datetime(pd.Series(list(dates))).dropna()
+                         .unique()).sort_values()
+    end = u.max() if end is None else pd.Timestamp(end)
+    u = u[u <= end]
+    if len(u) < 2:
+        return end
+    step = float(u.to_series().diff().dt.total_seconds().median()) / 86400.0
+    n = max(1, int(CURVE_WINDOW_DAYS // max(step, 1.0)))
+    return u[-n] if len(u) >= n else u[0]
+
+
 def _window_totals(datasheet: pd.DataFrame, window: str) -> pd.DataFrame:
     d = datasheet
     if window == "last12m":
         dates = pd.to_datetime(d[DATE_COL])
         end = dates.max()
-        d = d[dates >= end - pd.DateOffset(months=12) + pd.Timedelta(days=1)]
+        d = d[dates >= window_start(dates, end)]
     d = d.assign(Value=(d["Contribution"] * d["Cost"]) if "Cost" in d.columns
                  else np.nan)
     return d.groupby("Variable")[["Contribution", "Spend", "Raw", "Value"]].sum(
@@ -2453,7 +2472,7 @@ def last_12m_stats(
     """Mean daily volume and cost per unit over the final 12 months."""
     d = data.copy()
     d[date_col] = pd.to_datetime(d[date_col])
-    start = period_end - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+    start = window_start(d[date_col], period_end)
     window = d[(d[date_col] >= start) & (d[date_col] <= period_end)]
     if window.empty:
         raise ValueError(
@@ -2572,19 +2591,21 @@ def build_curve_sheets(structure: pd.DataFrame, datasheet: pd.DataFrame,
                        ) -> tuple[pd.DataFrame | None, pd.DataFrame | None, dict]:
     """Both curve sheets for every paid-media variable, or (None, None, report)
     with the reason when they cannot be built."""
-    report = {"built": [], "skipped": {}, "reason": None}
+    report = {"built": [], "skipped": {}, "reason": None, "unit_cost": False}
     if cost is None:
-        report["reason"] = ("no '(COSTS DEF)' sheet: the curves are in KPI value "
-                            "and need its per-period cost. Substituting 1 would "
-                            "silently change what the ROI axis means.")
-        return None, None, report
+        # No '(COSTS DEF)': the KPI is not converted to value, and the
+        # platform draws its curves with a cost of 1 per period -- confirmed
+        # on a weekly export, every value to 2e-12.
+        d0 = pd.to_datetime(datasheet["Period name"]).drop_duplicates()
+        cost = pd.Series(1.0, index=pd.DatetimeIndex(d0))
+        report["unit_cost"] = True
 
     ds = datasheet.copy()
     ds["Period name"] = pd.to_datetime(ds["Period name"])
     raw = ds.pivot_table(index="Period name", columns="Variable", values="Raw",
                          aggfunc="first").sort_index()
     end = raw.index.max()
-    start = end - pd.Timedelta(days=CURVE_WINDOW_DAYS - 1)
+    start = window_start(raw.index, end)
     win = np.asarray((raw.index >= start) & (raw.index <= end))
     cost_w = pd.to_numeric(cost, errors="coerce").reindex(raw.index[win])
     if cost_w.isna().any():
@@ -2609,6 +2630,8 @@ def build_curve_sheets(structure: pd.DataFrame, datasheet: pd.DataFrame,
         key = name.strip()
         if not key.startswith(MEDIA_PREFIX) or name not in raw.columns:
             continue
+        if parse_curve(row.get("Response Curve")) is None:
+            continue                  # linear: the platform draws no curve
         if key not in sp.columns:
             continue
         spend = pd.to_numeric(sp[key], errors="coerce").reindex(raw.index[win]) \
@@ -2837,13 +2860,12 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
     panel = model["panel"].sort_index()
     cost = model["cost"]
     if cost is None:
-        raise OwnCurveGateError(
-            f"own_curve for '{pooled_var}' needs the per-period cost series "
-            f"on '(COSTS DEF)', and the output file has none.")
+        # No '(COSTS DEF)': the platform's curves use a cost of 1 per period.
+        cost = pd.Series(1.0, index=pd.DatetimeIndex(panel.index))
     names = list(campaigns)
     X = panel[names].to_numpy(dtype=float)
     dates = panel.index
-    start = period_end - pd.Timedelta(days=CURVE_WINDOW_DAYS - 1)
+    start = window_start(dates, period_end)
     win = np.asarray((dates >= start) & (dates <= period_end))
     cost_w = pd.to_numeric(cost, errors="coerce").reindex(dates[win])
     if cost_w.isna().any():
@@ -3925,6 +3947,10 @@ def cmd_split(args) -> int:
             built_sheets[CURVES_SHEET] = STRUCTURE_SHEET
             print(f"BUILT '{CURVES_SHEET}' from the model: {len(rb['built'])} "
                   f"paid-media variable(s), the platform's own formula")
+            if rb.get("unit_cost"):
+                print(f"  NOTE: no '(COSTS DEF)' sheet, so the curves are in KPI "
+                      f"units (a cost of 1 per period), as the platform draws "
+                      f"them.")
             if ROI_CURVES_SHEET not in inp.output_sheets:
                 built_sheets[ROI_CURVES_SHEET] = "Comments"   # platform order
                 print(f"BUILT '{ROI_CURVES_SHEET}' from the same curves")
@@ -4195,6 +4221,11 @@ def cmd_split(args) -> int:
         if mode in ("own_curve", "native_curve"):
             if "cost_series" not in locals():
                 cost_series = load_cost_series(args.output_file)
+                if cost_series is None:
+                    print(f"  NOTE: no '{COSTS_SHEET}' sheet, so the campaign "
+                          f"curves use a cost of 1 per period: they are\n    in "
+                          f"KPI units, not KPI value, as the platform draws them "
+                          f"in that case.")
             model = {"coef": coef, "curve": curve_type, "alpha": alpha,
                      "model_dates": pd.to_datetime(
                          block["Period name"]).to_numpy(),
@@ -4728,7 +4759,7 @@ def cmd_check_effectiveness(path: str) -> int:
 
     ds["Period name"] = pd.to_datetime(ds["Period name"])
     period_end = ds["Period name"].max()
-    w12 = period_end - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+    w12 = window_start(ds["Period name"], period_end)
 
     totals = ds.groupby("Variable")[["Contribution", "Spend", "Raw"]].sum()
     rows = ts[ts["Effectiveness"].notna()][["Variable", "Effectiveness"]]
@@ -4852,7 +4883,7 @@ def cmd_check_coefficients(path: str) -> int:
     ds["Period name"] = pd.to_datetime(ds["Period name"])
 
     end = ds["Period name"].max()
-    w12 = end - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+    w12 = window_start(ds["Period name"], end)
     last12 = ds[ds["Period name"] >= w12]
 
     tot = ds.groupby("Variable")[["Contribution", "Spend", "Raw"]].sum()

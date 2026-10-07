@@ -177,6 +177,13 @@ st.success(f"{len(ins.variables)} variables in the model (from "
            f"'{S.COMPOSITE_SHEET}'.")
 for n in ins.notes:
     st.warning(n)
+if not ins.has_costs:
+    st.warning("**No '(COSTS DEF)' sheet in this output file.** Every response "
+               "curve the app builds or splits will use a cost of 1 per period, "
+               "so curve values, Efficiency and ROI are in **KPI units, not KPI "
+               "value** -- the same as the platform does without that sheet. "
+               "If the KPI should be valued, add '(COSTS DEF)' to the export "
+               "and upload it again.", icon=":material/info:")
 if not ins.has_curves:
     if ins.can_build_curves:
         st.info("This output file has no 'Response Curves' or 'T ROI curves' "
@@ -185,8 +192,7 @@ if not ins.has_curves:
                 "To only add them, run the checks with no variable selected.")
     else:
         st.warning("This output file has no curve sheets, and they cannot be "
-                   "built: that needs '(COSTS DEF)' and '(SPENDS DEF)' in the "
-                   "output file. The split itself still works.")
+                   "built: that needs '(SPENDS DEF)' in the output file. The split itself still works.")
 
 ignored = [k for k in S.PER_JOB if S.CONFIG_DEFAULTS[k]]
 if ignored:

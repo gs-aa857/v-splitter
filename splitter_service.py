@@ -441,7 +441,8 @@ class Inspection:
     notes: list[str] = field(default_factory=list)
     model_raw_cols: list[str] = field(default_factory=list)
     has_curves: bool = True                   # 'Response Curves' present
-    can_build_curves: bool = False            # costs and spends to build them
+    can_build_curves: bool = False            # spends to build them
+    has_costs: bool = True                    # '(COSTS DEF)' present
 
 
 def inspect(files) -> RunResult:
@@ -480,9 +481,9 @@ def inspect(files) -> RunResult:
             date_col=date_col, pooled_raw=pooled_raw, data=data, notes=notes,
             model_raw_cols=raw_cols,
             has_curves=M.CURVES_SHEET in inp.output_sheets,
-            can_build_curves=(M.COSTS_SHEET in inp.output_sheets
-                              and M.SPENDS_SHEET in inp.output_sheets
-                              and bool(M.BUILD_MISSING_CURVES)))
+            can_build_curves=(M.SPENDS_SHEET in inp.output_sheets
+                              and bool(M.BUILD_MISSING_CURVES)),
+            has_costs=M.COSTS_SHEET in inp.output_sheets)
 
     return run_isolated(files, {}, go)
 
