@@ -2833,6 +2833,75 @@ def fit_platform_native(A, cost_w, y, curve):
     return best(alpha)[0], alpha
 
 
+def native_params(model: dict, names: list[str]) -> dict:
+    """
+    The native parameters of every campaign of a split, fitted over the
+    WHOLE modelling period -- the period 'Structure' describes -- not the
+    last-year curve window, which only governs the ROI curves drawn from
+    them. A campaign that has not run in the last year still gets its
+    coefficient, curve and alpha.
+
+    For each campaign: scale the whole group by s across the modelling
+    period, take the campaign's share of the response day by day (its share
+    of the carried-over pressure, the rule that splits the contribution),
+    weighted by the per-period cost, and fit the platform's own form --
+    coefficient x SUM cost_t x f(alpha x carried-over raw_t), on the
+    campaign's own series -- to it. At s = 1 the target is the campaign's
+    contribution total, so the parameters stay on the contribution's level.
+    """
+    panel = model["panel"].sort_index()
+    X = panel[names].to_numpy(dtype=float)
+    dates = panel.index
+    md = model.get("model_dates")
+    mwin = np.ones(len(dates), dtype=bool) if md is None else np.isin(dates, md)
+    cost = model.get("cost")
+    if cost is None:
+        cost_m = np.ones(int(mwin.sum()))
+    else:
+        cost_m = pd.to_numeric(cost, errors="coerce").reindex(dates[mwin]) \
+            .fillna(1.0).to_numpy(dtype=float)
+    coef, curve, alpha = model["coef"], model["curve"], model["alpha"]
+    ret, lag, kern = model["retention"], model["lag"], model["kernel"]
+    if coef is None:
+        return {}
+    H = np.column_stack([geometric_adstock(np.where(mwin, 0.0, X[:, k]), ret,
+                                           peak_lag=lag, max_lag=kern)
+                         for k in range(len(names))])
+    W = np.column_stack([geometric_adstock(np.where(mwin, X[:, k], 0.0), ret,
+                                           peak_lag=lag, max_lag=kern)
+                         for k in range(len(names))])
+
+    def joint(sc):
+        Ai = H + sc * W
+        A = Ai.sum(axis=1)
+        f = apply_curve(A, curve, alpha)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = np.where(A[:, None] > 0, Ai / A[:, None], 0.0)
+        return coef * (f[mwin, None] * cost_m[:, None] * share[mwin]).sum(axis=0)
+
+    out = {}
+    for k, name in enumerate(names):
+        xi = X[mwin, k]
+        nzi = xi[xi != 0]
+        if not len(nzi):
+            continue
+        xb, mx = float(nzi.mean()), float(xi.max())
+        ss = np.linspace(0.0, mx / xb, 61)
+        y = np.array([joint(sc)[k] for sc in ss])
+        Am = np.array([(H[:, k] + sc * W[:, k])[mwin] for sc in ss])
+        coef_i, alpha_i = fit_platform_native(Am, cost_m, y, curve)
+        fit = coef_i * (apply_curve(Am, curve, alpha_i) * cost_m).sum(axis=1)
+        # The platform states the curve parameter as the share of the
+        # maximum reached at the mean non-zero raw value over the modelling
+        # period ('S Curve (40,0%)').
+        pct = float(_native_shape(alpha_i * xb, curve)) if curve else None
+        out[name] = {"coefficient": coef_i, "alpha": alpha_i,
+                     "type": curve or "linear", "percent": pct,
+                     "fit_error": float(np.max(np.abs(fit - y)) /
+                                        max(float(np.max(np.abs(y))), 1e-12))}
+    return out
+
+
 def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
                campaigns, period_end, date_col, kind: str = "own") -> dict:
     """
@@ -2933,33 +3002,15 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
                 share = np.where(A[:, None] > 0, Ai / A[:, None], 0.0)
             return coef * (f[win, None] * cost_w[:, None] * share[win]).sum(axis=0)
 
-        model_days = model.get("model_dates")
+        # Parameters fitted over the whole modelling period (native_params);
+        # here they only draw the last-year ROI curve, by the platform's own
+        # formula on the campaign's own series.
+        fitted = model.get("native_params") or native_params(model, names)
         for name in active:
-            k = names.index(name)
-            xi = X[win, k]
-            nzi = xi[xi != 0]
-            if not len(nzi):
+            if name not in fitted:
                 continue
-            xb, ni, mx = float(nzi.mean()), len(nzi), float(xi.max())
-            ss = np.linspace(0.0, mx / xb, 61)
-            y = np.array([joint(sc)[k] for sc in ss])           # window totals
-            # The campaign's own adstocked series at each scale, window days
-            Aw = np.array([(H[:, k] + sc * Wn[:, k])[win] for sc in ss])
-            coef_i, alpha_i = fit_platform_native(Aw, cost_w, y, curve)
-            fit = coef_i * (apply_curve(Aw, curve, alpha_i) * cost_w).sum(axis=1)
-            # The platform states the curve parameter as the share of the
-            # maximum reached at the variable's mean non-zero raw value over
-            # the model period ('S Curve (40,0%)').
-            raw_all = X[:, k] if model_days is None else \
-                X[np.isin(dates, model_days), k]
-            raw_nz = raw_all[raw_all != 0]
-            pct = float(_native_shape(alpha_i * raw_nz.mean(), curve)) \
-                if (curve and len(raw_nz)) else None
-            native[name] = {
-                "coefficient": coef_i, "alpha": alpha_i, "type": curve or "linear",
-                "percent": pct, "H": H[:, k], "W": Wn[:, k],
-                "fit_error": float(np.max(np.abs(fit - y)) /
-                                   max(float(np.max(np.abs(y))), 1e-12))}
+            k = names.index(name)
+            native[name] = dict(fitted[name], H=H[:, k], W=Wn[:, k])
 
         def native_window_total(name, sc):
             nv = native[name]
@@ -4217,20 +4268,26 @@ def cmd_split(args) -> int:
         mode = (CURVE_MODE.get(split.pooled, CURVE_MODE.get("default",
                                                              "shared_shape"))
                 if isinstance(CURVE_MODE, dict) else CURVE_MODE)
-        model = None
-        if mode in ("own_curve", "native_curve"):
-            if "cost_series" not in locals():
-                cost_series = load_cost_series(args.output_file)
-                if cost_series is None:
-                    print(f"  NOTE: no '{COSTS_SHEET}' sheet, so the campaign "
-                          f"curves use a cost of 1 per period: they are\n    in "
-                          f"KPI units, not KPI value, as the platform draws them "
-                          f"in that case.")
-            model = {"coef": coef, "curve": curve_type, "alpha": alpha,
-                     "model_dates": pd.to_datetime(
-                         block["Period name"]).to_numpy(),
-                     "retention": decay, "lag": lag, "kernel": kernel,
-                     "panel": r2["campaign_panel"], "cost": cost_series}
+        if "cost_series" not in locals():
+            cost_series = load_cost_series(args.output_file)
+            if cost_series is None:
+                print(f"  NOTE: no '{COSTS_SHEET}' sheet, so campaign curves "
+                      f"and parameters use a cost of 1 per\n    period: KPI "
+                      f"units, not KPI value, as the platform does in that "
+                      f"case.")
+        model = {"coef": coef, "curve": curve_type, "alpha": alpha,
+                 "native_params": None,
+                 "model_dates": pd.to_datetime(block["Period name"]).to_numpy(),
+                 "retention": decay, "lag": lag, "kernel": kernel,
+                 "panel": r2["campaign_panel"], "cost": cost_series}
+        # Structure's parameters describe the whole modelling period, so they
+        # are fitted for every campaign, active in the last year or not, and
+        # whatever the curve mode. Native curves are then drawn from them.
+        model["native_params"] = native_params(model, split.names)
+        if mode not in ("own_curve", "native_curve"):
+            model_for_curves = None
+        else:
+            model_for_curves = model
         curve_names = ([b.name for b in parse_blocks([str(c) for c in curves.columns])]
                        if curves is not None else [])
         r7 = None
@@ -4244,14 +4301,14 @@ def cmd_split(args) -> int:
             try:
                 curves, r7 = split_curves(curves, allocated, data, split.pooled,
                                           cmap, period_end, date_col=date_col,
-                                          model=model)
+                                          model=model_for_curves)
             except OwnCurveGateError as e:
                 print(f"\nSTOPPED. {e}")
                 return 1
 
         # Rows for the platform's own 'Structure' sheet.
         st_idx = structure.set_index(structure["Variable"].astype(str).str.strip())
-        nat = ((r7 or {}).get("own_curve") or {}).get("native") or {}
+        nat = model.get("native_params") or {}
         prow = []
         for c in split.campaigns:
             nv = nat.get(c.name)
@@ -4284,11 +4341,21 @@ def cmd_split(args) -> int:
                 rowp["sum_share"] = float(ci.sum()) / tot_p if tot_p else None
                 rowp["sd_share"] = float(ci.std(ddof=1)) / sd_p if sd_p else None
         platform_rows[split.pooled] = prow
-        if not nat:
-            print(f"  NOTE: the new '{PLATFORM_STRUCTURE_SHEET}' rows for these "
-                  f"campaigns carry no coefficient, curve\n    or alpha: those "
-                  f"come from native curves, and this variable uses "
-                  f"{(r7 or {}).get('curve_mode', 'no curve')}.")
+        if nat:
+            print(f"  '{PLATFORM_STRUCTURE_SHEET}' parameters, fitted over the whole "
+                  f"modelling period:")
+            for c in split.campaigns:
+                nv = nat.get(c.name)
+                if nv is None:
+                    print(f"    {c.name}: no activity in the modelling period, "
+                          f"no parameters")
+                    continue
+                pct = nv.get("percent")
+                label = (f"{nv['type']} ({pct * 100:.1f}%)".replace(".", ",")
+                         if pct is not None else nv["type"])
+                print(f"    {c.name}: {label}, coefficient "
+                      f"{nv['coefficient']:,.6g}, alpha {nv['alpha']:.6g} "
+                      f"(fit within {nv['fit_error']:.1%})")
 
         # The tall version of the same curves, built from the same numbers.
         if roi_curves is not None and r7 is not None:
