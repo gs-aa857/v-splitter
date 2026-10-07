@@ -3375,12 +3375,15 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
     copy (formatting, widths, colours) with each combined row replaced by one
     row per campaign, in the same place and the same style.
 
-    Per campaign: Coefficients Actual, Response Curve and Alpha are the native
+    Per campaign: normalized and standardized coefficients follow the
+    platform's own definitions applied to the campaign's contribution series
+    (share of the KPI total; standard deviation relative to the KPI's).
+    Coefficients Actual, Response Curve and Alpha are the native
     curve's own parameters (what the platform would need to draw that curve);
     Decay, Lag and Category are the combined variable's; ROI and CPU are the
-    campaign's, as on 'T structure'. Normalized/standardized coefficients,
-    SE, CI, t-Stat, p-Value and stars are left empty: the model never
-    estimated the campaigns, so there is nothing true to put there.
+    campaign's, as on 'T structure'. SE, CI, t-Stat, p-Value and stars are
+    left empty: the model never estimated the campaigns, so there is no
+    uncertainty to report for them.
     """
     from copy import copy
     if PLATFORM_STRUCTURE_SHEET not in wb.sheetnames or not rows_by_pooled:
@@ -3406,6 +3409,7 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
     if hdr_row is None:
         return {"rebuilt": False, "reason": "no header row with Decay/Alpha"}
     c_actual = cols.get("actual")
+    c_norm, c_std = cols.get("normalized"), cols.get("standardized")
     c_curve, c_alpha = cols.get("response curve"), cols.get("alpha")
     c_roi, c_cpu = cols.get("roi"), cols.get("cpu")
     keep = {cols.get(k) for k in ("decay", "lag", "category")} - {None}
@@ -3419,6 +3423,14 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
         if r0 is None or not rows:
             continue
         template = [new.cell(r0, c) for c in range(1, n_cols + 1)]
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        pooled_norm = _f(new.cell(r0, c_norm).value) if c_norm else None
+        pooled_std = _f(new.cell(r0, c_std).value) if c_std else None
         kept = {c: new.cell(r0, c).value for c in keep}
         styles = [(copy(t.font), copy(t.fill), copy(t.border), copy(t.alignment),
                    t.number_format, copy(t.protection)) for t in template]
@@ -3433,6 +3445,10 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
                 cell.alignment, cell.number_format, cell.protection = al, nf, pr
                 cell.value = kept.get(c)
             new.cell(r, 1).value = row["name"]
+            if c_norm and pooled_norm is not None and row.get("sum_share") is not None:
+                new.cell(r, c_norm).value = pooled_norm * row["sum_share"]
+            if c_std and pooled_std is not None and row.get("sd_share") is not None:
+                new.cell(r, c_std).value = pooled_std * row["sd_share"]
             if c_actual:
                 new.cell(r, c_actual).value = row.get("coefficient")
             if c_curve:
@@ -4221,6 +4237,21 @@ def cmd_split(args) -> int:
                 "cpu": (float(r_["CPU"]) if r_ is not None and "CPU" in r_.index
                         and pd.notna(r_["CPU"]) else None),
             })
+        # Normalized and standardized coefficients, from the campaign's own
+        # contribution series. The platform defines them as
+        #   normalized   = sum(contribution) / sum(actual KPI)
+        #   standardized = coefficient x sd(transformed) / sd(actual KPI)
+        #                = sd(contribution) / sd(actual KPI), signed
+        # (both confirmed on every variable of a real export to 1e-14), so a
+        # campaign's figure is the combined variable's figure scaled by its
+        # share of the contribution total and of its standard deviation.
+        pooled_c = block["Contribution"].astype(float).to_numpy()
+        tot_p, sd_p = float(pooled_c.sum()), float(pooled_c.std(ddof=1))
+        for rowp in prow:
+            if rowp["name"] in allocated.columns:
+                ci = allocated[rowp["name"]].astype(float).to_numpy()
+                rowp["sum_share"] = float(ci.sum()) / tot_p if tot_p else None
+                rowp["sd_share"] = float(ci.std(ddof=1)) / sd_p if sd_p else None
         platform_rows[split.pooled] = prow
         if not nat:
             print(f"  NOTE: the new '{PLATFORM_STRUCTURE_SHEET}' rows for these "
