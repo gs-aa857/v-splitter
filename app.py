@@ -123,7 +123,15 @@ def show_run(r: S.RunResult, ok_text: str) -> None:
 
 # ------------------------------------------------------------------- page ---
 
-st.title("MMM variable splitter")
+GUIDE = Path(__file__).with_name("HOW_TO_RUN_APP.pdf")
+t1, t2 = st.columns([5, 1], vertical_alignment="bottom")
+t1.title("MMM variable splitter")
+if GUIDE.exists():
+    t2.download_button("Help: open the guide", GUIDE.read_bytes(),
+                       file_name=GUIDE.name, mime="application/pdf",
+                       icon=":material/help:", width="stretch",
+                       help="The user guide (PDF): steps, settings, the four "
+                            "curve methods and when to use which.")
 st.caption("Replaces a combined media variable with the campaigns it was "
            "built from. Your files are held in memory for this browser "
            "session only. Each check or run copies them to a temporary folder "

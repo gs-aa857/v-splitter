@@ -2775,6 +2775,41 @@ def fit_native(x, y, curve):
     return best_b(a)[0], a
 
 
+def fit_platform_native(A, cost_w, y, curve):
+    """
+    (coefficient, alpha) so that the platform's own formula on the campaign's
+    own series -- coefficient x SUM over the window of cost_t x f(alpha x
+    adstocked raw_t) -- reproduces y at every scale in A (rows: scales,
+    columns: window days). For each alpha the best coefficient is closed
+    form; alpha is searched on a log grid and refined.
+    """
+    y = np.asarray(y, dtype=float)
+    if curve is None:
+        phi = (A * cost_w).sum(axis=1)
+        d = float(phi @ phi)
+        return (float(phi @ y) / d if d else 0.0), 1.0
+    ref = float(np.mean(A[A > 0])) if (A > 0).any() else 1.0
+
+    def best(alpha):
+        phi = (apply_curve(A, curve, alpha) * cost_w).sum(axis=1)
+        d = float(phi @ phi)
+        if d <= 0:
+            return 0.0, np.inf
+        c = float(phi @ y) / d
+        return c, float(np.sum((c * phi - y) ** 2))
+
+    grid = np.geomspace(1e-4, 50.0, 300) / ref
+    errs = [best(a)[1] for a in grid]
+    j = int(np.argmin(errs))
+    lo = np.log(grid[max(j - 1, 0)])
+    hi = np.log(grid[min(j + 1, len(grid) - 1)])
+    from scipy.optimize import minimize_scalar
+    r = minimize_scalar(lambda la: best(np.exp(la))[1], bounds=(lo, hi),
+                        method="bounded", options={"xatol": 1e-10})
+    alpha = float(np.exp(r.x)) if r.success else float(grid[j])
+    return best(alpha)[0], alpha
+
+
 def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
                campaigns, period_end, date_col, kind: str = "own") -> dict:
     """
@@ -2876,7 +2911,7 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
                 share = np.where(A[:, None] > 0, Ai / A[:, None], 0.0)
             return coef * (f[win, None] * cost_w[:, None] * share[win]).sum(axis=0)
 
-        base0 = joint(0.0)
+        model_days = model.get("model_dates")
         for name in active:
             k = names.index(name)
             xi = X[win, k]
@@ -2885,13 +2920,30 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
                 continue
             xb, ni, mx = float(nzi.mean()), len(nzi), float(xi.max())
             ss = np.linspace(0.0, mx / xb, 61)
-            y = np.array([(joint(sc)[k] - base0[k]) / ni for sc in ss])
-            xs = ss * xb
-            b_i, a_i = fit_native(xs, y, curve)
-            fit = b_i * _native_shape(a_i * xs, curve)
-            native[name] = {"b": b_i, "a": a_i, "type": curve or "linear",
-                            "fit_error": float(np.max(np.abs(fit - y)) /
-                                               max(float(np.max(np.abs(y))), 1e-12))}
+            y = np.array([joint(sc)[k] for sc in ss])           # window totals
+            # The campaign's own adstocked series at each scale, window days
+            Aw = np.array([(H[:, k] + sc * Wn[:, k])[win] for sc in ss])
+            coef_i, alpha_i = fit_platform_native(Aw, cost_w, y, curve)
+            fit = coef_i * (apply_curve(Aw, curve, alpha_i) * cost_w).sum(axis=1)
+            # The platform states the curve parameter as the share of the
+            # maximum reached at the variable's mean non-zero raw value over
+            # the model period ('S Curve (40,0%)').
+            raw_all = X[:, k] if model_days is None else \
+                X[np.isin(dates, model_days), k]
+            raw_nz = raw_all[raw_all != 0]
+            pct = float(_native_shape(alpha_i * raw_nz.mean(), curve)) \
+                if (curve and len(raw_nz)) else None
+            native[name] = {
+                "coefficient": coef_i, "alpha": alpha_i, "type": curve or "linear",
+                "percent": pct, "H": H[:, k], "W": Wn[:, k],
+                "fit_error": float(np.max(np.abs(fit - y)) /
+                                   max(float(np.max(np.abs(y))), 1e-12))}
+
+        def native_window_total(name, sc):
+            nv = native[name]
+            A = (nv["H"] + sc * nv["W"])[win]
+            return nv["coefficient"] * float(np.sum(
+                apply_curve(A, curve, nv["alpha"]) * cost_w))
 
     for name in active:
         k = names.index(name)
@@ -2917,8 +2969,8 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
         zero = at(0.0)
         grid = np.linspace(0.0, ratio * max_i, int(valid.sum()))
         if kind == "native":
-            b_i, a_i = native[name]["b"], native[name]["a"]
-            kpi = b_i * _native_shape(a_i * grid, curve)
+            kpi = np.array([native_window_total(name, g / xbar_i)
+                            for g in grid]) / n_i
         else:
             kpi = np.array([at(g) for g in grid]) - zero
         spend = grid * cpu
@@ -2935,19 +2987,18 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
         di = 0 if di <= 1 else di
         if kind == "native":
             nat = native[name]
-            avg_k = float(b_i * _native_shape(a_i * xbar_i, curve))
-            max_k = float(b_i * _native_shape(a_i * max_i, curve))
+            avg_k = native_window_total(name, 1.0) / n_i
+            max_k = native_window_total(name, max_i / xbar_i) / n_i
             # slope against the own curve within +/-20% of current pressure
             errs = []
             for f in (0.8, 0.9, 1.0, 1.1, 1.2):
                 x0, h = f * xbar_i, 0.01 * xbar_i
                 own_m = (at(x0 + h) - at(x0 - h)) / (2 * h)
-                nat_m = float(_native_slope(x0, b_i, a_i, curve))
+                nat_m = (native_window_total(name, (x0 + h) / xbar_i) -
+                         native_window_total(name, (x0 - h) / xbar_i)) / (2 * h * n_i)
                 if own_m:
                     errs.append((f, nat_m / own_m - 1.0))
             nat["slope_vs_own"] = errs
-            nat["share_of_max_at_average"] = float(
-                _native_shape(a_i * xbar_i, curve)) if curve else None
             nat["n_active"] = n_i
             nat["xbar"] = xbar_i
         else:
@@ -2971,21 +3022,20 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
         s_max = float(pooled_w.max()) / xbar
         gaps = []
         for sc in np.linspace(0.0, s_max, 41):
-            group = response(np.full(len(names), sc)) - response(np.zeros(len(names)))
-            parts = sum(native[n]["b"] * float(_native_shape(
-                native[n]["a"] * sc * native[n]["xbar"], curve)) * native[n]["n_active"]
-                for n in active)
+            group = response(np.full(len(names), sc))
+            parts = sum(native_window_total(n, sc) for n in active)
             gaps.append((sc, parts - group))
-        scale_g = max(abs(pooled_incr), 1e-12)
+        scale_g = max(abs(response(np.ones(len(names)))), 1e-12)
+        for nv in native.values():
+            nv.pop("H", None)
+            nv.pop("W", None)
         out["native"] = native
         out["additivity_gap"] = max(abs(g) for _, g in gaps) / scale_g
         out["additivity_at_current"] = next(
             (g for sc, g in gaps if abs(sc - 1.0) < 1e-9), None)
         if out["additivity_at_current"] is None:
             group1 = pooled_incr
-            parts1 = sum(summary[n]["Average"][2] * native[n]["n_active"]
-                         for n in active)
-            out["additivity_at_current"] = parts1 - group1
+            out["additivity_at_current"] = 0.0
         out["additivity_at_current"] /= scale_g
     return out
 
@@ -3313,6 +3363,90 @@ def _row_styles(ws, row_idx: int, n_cols: int) -> list[dict]:
     return out
 
 
+PLATFORM_STRUCTURE_SHEET = "Structure"
+ORIGINAL_STRUCTURE_SHEET = "Structure (original)"
+
+
+def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
+    """
+    The platform's own 'Structure' sheet with the split campaigns in place of
+    their combined variable. The original is kept, renamed
+    'Structure (original)', right after it; the new sheet is a cell-for-cell
+    copy (formatting, widths, colours) with each combined row replaced by one
+    row per campaign, in the same place and the same style.
+
+    Per campaign: Coefficients Actual, Response Curve and Alpha are the native
+    curve's own parameters (what the platform would need to draw that curve);
+    Decay, Lag and Category are the combined variable's; ROI and CPU are the
+    campaign's, as on 'T structure'. Normalized/standardized coefficients,
+    SE, CI, t-Stat, p-Value and stars are left empty: the model never
+    estimated the campaigns, so there is nothing true to put there.
+    """
+    from copy import copy
+    if PLATFORM_STRUCTURE_SHEET not in wb.sheetnames or not rows_by_pooled:
+        return {"rebuilt": False}
+    old = wb[PLATFORM_STRUCTURE_SHEET]
+    idx = wb.sheetnames.index(PLATFORM_STRUCTURE_SHEET)
+    new = wb.copy_worksheet(old)
+    old.title = ORIGINAL_STRUCTURE_SHEET
+    new.title = PLATFORM_STRUCTURE_SHEET
+    wb._sheets.remove(new)
+    wb._sheets.insert(idx, new)
+    new.sheet_view.tabSelected = False
+
+    # column positions from the sub-header row (the one holding 'Decay')
+    hdr_row, cols = None, {}
+    for r in range(1, min(new.max_row, 15) + 1):
+        vals = [str(c.value).strip().casefold() if c.value is not None else ""
+                for c in new[r]]
+        if "decay" in vals and "alpha" in vals:
+            hdr_row = r
+            cols = {v: i + 1 for i, v in enumerate(vals) if v}
+            break
+    if hdr_row is None:
+        return {"rebuilt": False, "reason": "no header row with Decay/Alpha"}
+    c_actual = cols.get("actual")
+    c_curve, c_alpha = cols.get("response curve"), cols.get("alpha")
+    c_roi, c_cpu = cols.get("roi"), cols.get("cpu")
+    keep = {cols.get(k) for k in ("decay", "lag", "category")} - {None}
+    n_cols = new.max_column
+
+    done = []
+    for pooled, rows in rows_by_pooled.items():
+        r0 = next((r for r in range(hdr_row + 1, new.max_row + 1)
+                   if str(new.cell(r, 1).value or "").strip() == pooled.strip()),
+                  None)
+        if r0 is None or not rows:
+            continue
+        template = [new.cell(r0, c) for c in range(1, n_cols + 1)]
+        kept = {c: new.cell(r0, c).value for c in keep}
+        styles = [(copy(t.font), copy(t.fill), copy(t.border), copy(t.alignment),
+                   t.number_format, copy(t.protection)) for t in template]
+        if len(rows) > 1:
+            new.insert_rows(r0 + 1, len(rows) - 1)
+        for i, row in enumerate(rows):
+            r = r0 + i
+            for c in range(1, n_cols + 1):
+                cell = new.cell(r, c)
+                f, fl, b, al, nf, pr = styles[c - 1]
+                cell.font, cell.fill, cell.border = f, fl, b
+                cell.alignment, cell.number_format, cell.protection = al, nf, pr
+                cell.value = kept.get(c)
+            new.cell(r, 1).value = row["name"]
+            if c_actual:
+                new.cell(r, c_actual).value = row.get("coefficient")
+            if c_curve:
+                new.cell(r, c_curve).value = row.get("curve_text")
+            if c_alpha:
+                new.cell(r, c_alpha).value = row.get("alpha")
+            if c_roi:
+                new.cell(r, c_roi).value = row.get("roi")
+            if c_cpu:
+                new.cell(r, c_cpu).value = row.get("cpu")
+        done.append(pooled)
+    return {"rebuilt": True, "variables": done}
+
+
 def _platform_curve_format(ws, sheet_name: str) -> None:
     """
     The curve sheets cell for cell as the platform writes them, so whatever
@@ -3412,6 +3546,7 @@ def write_output(
     column_change_sheets: set[str] | None = None,
     header_rows: dict[str, int] | None = None,
     new_sheets: dict[str, str | None] | None = None,
+    platform_structure_rows: dict | None = None,
 ) -> Path:
     """
     source_path          : the untouched original output file
@@ -3465,6 +3600,8 @@ def write_output(
                          allow_column_change=name in column_change_sheets)
             if name in (CURVES_SHEET, ROI_CURVES_SHEET):
                 _platform_curve_format(wb[name], name)
+        if platform_structure_rows:
+            rebuild_platform_structure(wb, platform_structure_rows)
         wb.save(tmp_path)
 
         # The written file must actually differ from the source. If it does
@@ -3508,8 +3645,17 @@ def verify_written(dest_path: Path, source_path: Path,
     original = pd.read_excel(source_path, sheet_name=None)
 
     result = {"file": str(dest_path), "sheets": {}}
+    rebuilt = ORIGINAL_STRUCTURE_SHEET in written and \
+        ORIGINAL_STRUCTURE_SHEET not in original
+    if rebuilt:
+        original = dict(original)
+        original[ORIGINAL_STRUCTURE_SHEET] = original.get(PLATFORM_STRUCTURE_SHEET)
     for name in written:
         entry = {"rows": len(written[name]), "columns": len(written[name].columns)}
+        if rebuilt and name == PLATFORM_STRUCTURE_SHEET:
+            entry["status"] = "rebuilt: campaigns in place of combined variables"
+            result["sheets"][name] = entry
+            continue
         if name in updates:
             exp = updates[name]
             entry["status"] = "modified"
@@ -3558,17 +3704,20 @@ def verify_written(dest_path: Path, source_path: Path,
                     # some exports store rows in an order that reads back
                     # differently once the file is re-saved in order. Judge
                     # by the cells themselves before calling it changed.
-                    if _cells_identical(source_path, dest_path, name):
+                    src_name = (PLATFORM_STRUCTURE_SHEET
+                                if name == ORIGINAL_STRUCTURE_SHEET else name)
+                    if _cells_identical(source_path, dest_path, name, src_name):
                         entry["identical_to_source"] = True
                         entry["note"] = "cells identical; source rows stored out of order"
         result["sheets"][name] = entry
     return result
 
 
-def _cells_identical(source_path, dest_path, sheet: str) -> bool:
+def _cells_identical(source_path, dest_path, sheet: str,
+                     source_sheet: str | None = None) -> bool:
     from openpyxl import load_workbook
     try:
-        a = load_workbook(source_path)[sheet]
+        a = load_workbook(source_path)[source_sheet or sheet]
         b = load_workbook(dest_path)[sheet]
     except Exception:                                 # noqa: BLE001
         return False
@@ -3742,6 +3891,7 @@ def cmd_split(args) -> int:
     curves = (pd.read_excel(args.output_file, sheet_name=CURVES_SHEET)
               if CURVES_SHEET in inp.output_sheets else None)
     built_sheets: dict[str, str | None] = {}
+    platform_rows: dict[str, list] = {}
     if curves is None and BUILD_MISSING_CURVES:
         sp_for_curves = canon_cols(pd.read_excel(
             args.output_file, sheet_name=SPENDS_SHEET,
@@ -4030,6 +4180,8 @@ def cmd_split(args) -> int:
             if "cost_series" not in locals():
                 cost_series = load_cost_series(args.output_file)
             model = {"coef": coef, "curve": curve_type, "alpha": alpha,
+                     "model_dates": pd.to_datetime(
+                         block["Period name"]).to_numpy(),
                      "retention": decay, "lag": lag, "kernel": kernel,
                      "panel": r2["campaign_panel"], "cost": cost_series}
         curve_names = ([b.name for b in parse_blocks([str(c) for c in curves.columns])]
@@ -4049,6 +4201,32 @@ def cmd_split(args) -> int:
             except OwnCurveGateError as e:
                 print(f"\nSTOPPED. {e}")
                 return 1
+
+        # Rows for the platform's own 'Structure' sheet.
+        st_idx = structure.set_index(structure["Variable"].astype(str).str.strip())
+        nat = ((r7 or {}).get("own_curve") or {}).get("native") or {}
+        prow = []
+        for c in split.campaigns:
+            nv = nat.get(c.name)
+            pct = nv.get("percent") if nv else None
+            r_ = st_idx.loc[c.name.strip()] if c.name.strip() in st_idx.index else None
+            prow.append({
+                "name": c.name,
+                "coefficient": nv["coefficient"] if nv else None,
+                "alpha": nv["alpha"] if (nv and nv["type"] != "linear") else None,
+                "curve_text": (f"{nv['type']} ({pct * 100:.1f}%)".replace(".", ",")
+                               if (nv and pct is not None) else None),
+                "roi": (float(r_["ROI"]) if r_ is not None and "ROI" in r_.index
+                        and pd.notna(r_["ROI"]) else None),
+                "cpu": (float(r_["CPU"]) if r_ is not None and "CPU" in r_.index
+                        and pd.notna(r_["CPU"]) else None),
+            })
+        platform_rows[split.pooled] = prow
+        if not nat:
+            print(f"  NOTE: the new '{PLATFORM_STRUCTURE_SHEET}' rows for these "
+                  f"campaigns carry no coefficient, curve\n    or alpha: those "
+                  f"come from native curves, and this variable uses "
+                  f"{(r7 or {}).get('curve_mode', 'no curve')}.")
 
         # The tall version of the same curves, built from the same numbers.
         if roi_curves is not None and r7 is not None:
@@ -4138,16 +4316,16 @@ def cmd_split(args) -> int:
                     print(f"    native curves: fitted to each campaign's share when "
                           f"the whole group moves")
                     for nm, nv in oc["native"].items():
-                        pct = nv.get("share_of_max_at_average")
+                        pct = nv.get("percent")
                         sl = nv.get("slope_vs_own") or []
                         lo = min((e for _, e in sl), default=float("nan"))
                         hi = max((e for _, e in sl), default=float("nan"))
                         at1 = next((e for f, e in sl if f == 1.0), float("nan"))
                         print(f"      {nm}: {nv['type']}"
-                              + (f", {pct:.1%} of its maximum at average pressure"
+                              + (f" ({pct * 100:.1f}%)".replace(".", ",")
                                  if pct is not None else "")
-                              + f"\n        height {nv['b']:,.4g}, parameter "
-                                f"{nv['a']:.6g}; fit to the joint-move curve within "
+                              + f"\n        coefficient {nv['coefficient']:,.6g}, alpha "
+                                f"{nv['alpha']:.6g}; fit to the joint-move curve within "
                                 f"{nv['fit_error']:.1%}"
                               + f"\n        slope vs own curve at current {at1:+.0%}, "
                                 f"within +/-20% of current pressure {lo:+.0%} to "
@@ -4264,7 +4442,8 @@ def cmd_split(args) -> int:
                             header_rows={SPENDS_SHEET: hdr + 1,
                                          CONTRIB_SHEET: hdr_ic + 1,
                                          WEEKLY_CONTRIB_SHEET: hdr_wk + 1},
-                            new_sheets=built_sheets)
+                            new_sheets=built_sheets,
+                            platform_structure_rows=platform_rows)
     except PermissionError as e:
         print(f"\nSTOPPED. {e}")
         return 1
