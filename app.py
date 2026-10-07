@@ -29,6 +29,7 @@ st.set_page_config(page_title="MMM variable splitter", layout="wide")
 
 PASS_ICON, FAIL_ICON, WARN_ICON = "✅", "❌", "⚠️"
 CURVE_LABELS = {
+    "native_curve": "Native curve per campaign (fitted, group moves together)",
     "own_curve": "Own curve per campaign (built from the model)",
     "shared_shape": "Same shape, differing by cost",
     "additive": "Scaled by volume (sums to the pooled curve)",

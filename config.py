@@ -183,8 +183,21 @@ ACCEPT_RAW_MISMATCH: dict[str, str] = {}
 #
 # The model only ever estimated one curve. These are three ways of
 # presenting that single fact; own_curve is the one that answers "what would
-# more spend on this campaign return?" -- and it is the default.
-CURVE_MODE = "own_curve"
+# more spend on this campaign return, the others unchanged?"
+#
+#   "native_curve"  (the default) a platform-type curve per campaign -- the
+#                   variable's own curve type, with its own height and one
+#                   parameter -- fitted to the campaign's share of the response
+#                   when the WHOLE GROUP moves together (day by day, with
+#                   carry-over, by the same rule that splits the contribution).
+#                   Starts at zero, adds up to the group when the campaigns
+#                   move in proportion, and is exact on that kind of move. For
+#                   moving money between campaigns of the same group it is
+#                   conservative: slopes are understated above current spend
+#                   and overstated below it. The run prints, per campaign, the
+#                   fit, the slope difference to own_curve within +/-20% of
+#                   current pressure, and how well the curves add up.
+CURVE_MODE = "native_curve"
 
 
 # When the model output has no 'Response Curves' / 'T ROI curves' sheets,

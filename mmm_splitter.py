@@ -2666,9 +2666,12 @@ def build_curve_sheets(structure: pd.DataFrame, datasheet: pd.DataFrame,
     cols = ["Product", "Market"]
     for i, c in enumerate(curves):
         n = c["name"]
-        # As platform 0.6.0 spells them: the shared pair 'pressure'/'Spend',
-        # every other channel '<name> pressure'/'<name> spend'.
-        cols += (["pressure", "Spend"] if i == 0 else
+        # Exactly as the platform spells them: the shared pair is ' pressure'
+        # and ' spend' -- leading space, lower case, the label with an empty
+        # name in front -- and every other channel '<name> pressure' /
+        # '<name> spend'. (Anonymised copies show 'pressure' / 'Spend'; the
+        # real export, and the budget optimiser reading it, use these.)
+        cols += ([GLOBAL_PRESSURE, GLOBAL_SPEND] if i == 0 else
                  [f"{n} pressure", f"{n} spend"])
         cols += [n, f"{n} Efficiency", f"{n} Marginal Efficiency"]
     cols += SUMMARY_COLS
@@ -2719,8 +2722,61 @@ class OwnCurveGateError(ValueError):
 CURVE_WINDOW_DAYS = 365      # the platform's default response-curve window
 
 
+def _native_shape(v, curve):
+    v = np.asarray(v, dtype=float)
+    if curve == "S Curve":
+        return (v / (1.0 + v)) * (1.0 - np.exp(-v))
+    if curve == "Diminishing Returns":
+        return 1.0 - np.exp(-v)
+    return v
+
+
+def _native_slope(x, b, a, curve):
+    v = a * np.asarray(x, dtype=float)
+    if curve == "S Curve":
+        dg = (1.0 - np.exp(-v)) / (1.0 + v) ** 2 + (v / (1.0 + v)) * np.exp(-v)
+    elif curve == "Diminishing Returns":
+        dg = np.exp(-v)
+    else:
+        dg = np.ones_like(v)
+    return b * a * dg
+
+
+def fit_native(x, y, curve):
+    """
+    b * shape(a * x), the platform's own curve form with its own height (b)
+    and one curve parameter (a), least squares to (x, y). For each a, the best
+    b is closed-form; a is searched on a log grid then refined. A linear
+    variable gets a straight line (a = 1, shape = identity).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if curve is None:
+        b = float(x @ y / (x @ x)) if x @ x > 0 else 0.0
+        return b, 1.0
+    xm = float(x.max()) or 1.0
+
+    def best_b(a):
+        phi = _native_shape(a * x, curve)
+        d = float(phi @ phi)
+        if d <= 0:
+            return 0.0, np.inf
+        b = float(phi @ y) / d
+        return b, float(np.sum((b * phi - y) ** 2))
+
+    grid = np.geomspace(1e-3, 60.0, 400) / xm
+    errs = [best_b(a)[1] for a in grid]
+    j = int(np.argmin(errs))
+    lo, hi = np.log(grid[max(j - 1, 0)]), np.log(grid[min(j + 1, len(grid) - 1)])
+    from scipy.optimize import minimize_scalar
+    r = minimize_scalar(lambda la: best_b(np.exp(la))[1], bounds=(lo, hi),
+                        method="bounded", options={"xatol": 1e-10})
+    a = float(np.exp(r.x)) if r.success else float(grid[j])
+    return best_b(a)[0], a
+
+
 def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
-               campaigns, period_end, date_col) -> dict:
+               campaigns, period_end, date_col, kind: str = "own") -> dict:
     """
     Each campaign's own response curve: scale THAT campaign inside the curve
     window, hold every other campaign at what it actually ran, and read the
@@ -2797,6 +2853,46 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
     d = d.set_index(date_col)
     built, summary, increments = {}, {}, {}
     n_pts = len(p_pool)
+
+    native = {}
+    if kind == "native":
+        # Joint-move curves: the whole group scaled by s inside the window,
+        # each campaign's share of the response it gets day by day (its share
+        # of the adstocked pressure -- the same rule that splits the
+        # contribution). Adstock and lag are linear, so each campaign's
+        # carry-over is its history part H plus s times its window part W.
+        H = np.column_stack([geometric_adstock(np.where(win, 0.0, X[:, k]),
+                                               ret, peak_lag=lag, max_lag=kern)
+                             for k in range(len(names))])
+        Wn = np.column_stack([geometric_adstock(np.where(win, X[:, k], 0.0),
+                                                ret, peak_lag=lag, max_lag=kern)
+                              for k in range(len(names))])
+
+        def joint(sc):
+            Ai = H + sc * Wn
+            A = Ai.sum(axis=1)
+            f = apply_curve(A, curve, alpha)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                share = np.where(A[:, None] > 0, Ai / A[:, None], 0.0)
+            return coef * (f[win, None] * cost_w[:, None] * share[win]).sum(axis=0)
+
+        base0 = joint(0.0)
+        for name in active:
+            k = names.index(name)
+            xi = X[win, k]
+            nzi = xi[xi != 0]
+            if not len(nzi):
+                continue
+            xb, ni, mx = float(nzi.mean()), len(nzi), float(xi.max())
+            ss = np.linspace(0.0, mx / xb, 61)
+            y = np.array([(joint(sc)[k] - base0[k]) / ni for sc in ss])
+            xs = ss * xb
+            b_i, a_i = fit_native(xs, y, curve)
+            fit = b_i * _native_shape(a_i * xs, curve)
+            native[name] = {"b": b_i, "a": a_i, "type": curve or "linear",
+                            "fit_error": float(np.max(np.abs(fit - y)) /
+                                               max(float(np.max(np.abs(y))), 1e-12))}
+
     for name in active:
         k = names.index(name)
         xi = X[win, k]
@@ -2820,7 +2916,11 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
 
         zero = at(0.0)
         grid = np.linspace(0.0, ratio * max_i, int(valid.sum()))
-        kpi = np.array([at(g) for g in grid]) - zero
+        if kind == "native":
+            b_i, a_i = native[name]["b"], native[name]["a"]
+            kpi = b_i * _native_shape(a_i * grid, curve)
+        else:
+            kpi = np.array([at(g) for g in grid]) - zero
         spend = grid * cpu
         with np.errstate(divide="ignore", invalid="ignore"):
             roi = np.where(spend > 0, kpi / spend, np.nan)
@@ -2833,7 +2933,25 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
         usable = np.where(np.isfinite(roi), roi, -np.inf)
         di = int(np.argmax(usable))
         di = 0 if di <= 1 else di
-        avg_k, max_k = at(xbar_i) - zero, at(max_i) - zero
+        if kind == "native":
+            nat = native[name]
+            avg_k = float(b_i * _native_shape(a_i * xbar_i, curve))
+            max_k = float(b_i * _native_shape(a_i * max_i, curve))
+            # slope against the own curve within +/-20% of current pressure
+            errs = []
+            for f in (0.8, 0.9, 1.0, 1.1, 1.2):
+                x0, h = f * xbar_i, 0.01 * xbar_i
+                own_m = (at(x0 + h) - at(x0 - h)) / (2 * h)
+                nat_m = float(_native_slope(x0, b_i, a_i, curve))
+                if own_m:
+                    errs.append((f, nat_m / own_m - 1.0))
+            nat["slope_vs_own"] = errs
+            nat["share_of_max_at_average"] = float(
+                _native_shape(a_i * xbar_i, curve)) if curve else None
+            nat["n_active"] = n_i
+            nat["xbar"] = xbar_i
+        else:
+            avg_k, max_k = at(xbar_i) - zero, at(max_i) - zero
         summary[name] = {
             "Average": (xbar_i, xbar_i * cpu, avg_k),
             "Maximum": (max_i, max_i * cpu, max_k),
@@ -2844,9 +2962,32 @@ def own_curves(pooled_var, active, model, p_pool, r_pool, valid, data,
 
     pooled_incr = response(np.ones(len(names))) - response(np.zeros(len(names)))
     share = sum(increments.values()) / pooled_incr if pooled_incr else float("nan")
-    return {"built": built, "summary": summary, "gate_error": gate,
-            "window": (pd.Timestamp(start), pd.Timestamp(period_end)),
-            "increments_share_of_pooled": share}
+    out = {"built": built, "summary": summary, "gate_error": gate,
+           "window": (pd.Timestamp(start), pd.Timestamp(period_end)),
+           "increments_share_of_pooled": share, "kind": kind}
+    if kind == "native":
+        # How well the native curves add up to the group when all campaigns
+        # scale together, over the range the group actually ran at.
+        s_max = float(pooled_w.max()) / xbar
+        gaps = []
+        for sc in np.linspace(0.0, s_max, 41):
+            group = response(np.full(len(names), sc)) - response(np.zeros(len(names)))
+            parts = sum(native[n]["b"] * float(_native_shape(
+                native[n]["a"] * sc * native[n]["xbar"], curve)) * native[n]["n_active"]
+                for n in active)
+            gaps.append((sc, parts - group))
+        scale_g = max(abs(pooled_incr), 1e-12)
+        out["native"] = native
+        out["additivity_gap"] = max(abs(g) for _, g in gaps) / scale_g
+        out["additivity_at_current"] = next(
+            (g for sc, g in gaps if abs(sc - 1.0) < 1e-9), None)
+        if out["additivity_at_current"] is None:
+            group1 = pooled_incr
+            parts1 = sum(summary[n]["Average"][2] * native[n]["n_active"]
+                         for n in active)
+            out["additivity_at_current"] = parts1 - group1
+        out["additivity_at_current"] /= scale_g
+    return out
 
 
 def split_curves(
@@ -2956,13 +3097,14 @@ def split_curves(
     #   sum to the pooled curve. Correct for an unconstrained optimiser, but
     #   every campaign saturates almost at once and then sits at a plateau set
     #   by its volume, which reads as a performance ranking and is not one.
-    if mode not in ("shared_shape", "additive", "own_curve"):
+    if mode not in ("shared_shape", "additive", "own_curve", "native_curve"):
         raise ValueError(f"Unknown CURVE_MODE {mode!r} for '{pooled_var}'. "
-                         f"Use shared_shape, additive or own_curve.")
+                         f"Use native_curve, own_curve, shared_shape or additive.")
     own = None
-    if mode == "own_curve":
+    if mode in ("own_curve", "native_curve"):
         own = own_curves(pooled_var, active, model, p_pool, r_pool, valid,
-                         data, campaigns, period_end, date_col)
+                         data, campaigns, period_end, date_col,
+                         kind="native" if mode == "native_curve" else "own")
 
     built = {}
     for name in (active if own is None else []):
@@ -3089,7 +3231,7 @@ def split_curves(
             out.loc[new_curve_rows, col] = c[sub]
 
     # ---- checks ----------------------------------------------------------
-    if mode == "own_curve":
+    if mode in ("own_curve", "native_curve"):
         resid = own["gate_error"]
     elif mode == "shared_shape":
         # By construction each campaign carries the pooled response, so the
@@ -3884,7 +4026,7 @@ def cmd_split(args) -> int:
                                                              "shared_shape"))
                 if isinstance(CURVE_MODE, dict) else CURVE_MODE)
         model = None
-        if mode == "own_curve":
+        if mode in ("own_curve", "native_curve"):
             if "cost_series" not in locals():
                 cost_series = load_cost_series(args.output_file)
             model = {"coef": coef, "curve": curve_type, "alpha": alpha,
@@ -3981,7 +4123,9 @@ def cmd_split(args) -> int:
                 "shared_shape": "  (campaigns differ by cost only; they do NOT sum "
                                 "to the pooled curve)",
                 "additive": "  (campaigns sum to the pooled curve)",
-                "own_curve": "  (each campaign scaled alone, others held at "
+                "native_curve": "  (platform-type curve per campaign, fitted to "
+                            "its share when the whole group moves)",
+            "own_curve": "  (each campaign scaled alone, others held at "
                              "actual; built from the model)",
             }.get(r7['curve_mode'], ""))
             oc = r7.get("own_curve")
@@ -3990,6 +4134,28 @@ def cmd_split(args) -> int:
                       f"to {oc['gate_error']:.1e} (relative)")
                 print(f"    curve window {oc['window'][0]:%Y-%m-%d} to "
                       f"{oc['window'][1]:%Y-%m-%d}")
+                if oc.get("kind") == "native":
+                    print(f"    native curves: fitted to each campaign's share when "
+                          f"the whole group moves")
+                    for nm, nv in oc["native"].items():
+                        pct = nv.get("share_of_max_at_average")
+                        sl = nv.get("slope_vs_own") or []
+                        lo = min((e for _, e in sl), default=float("nan"))
+                        hi = max((e for _, e in sl), default=float("nan"))
+                        at1 = next((e for f, e in sl if f == 1.0), float("nan"))
+                        print(f"      {nm}: {nv['type']}"
+                              + (f", {pct:.1%} of its maximum at average pressure"
+                                 if pct is not None else "")
+                              + f"\n        height {nv['b']:,.4g}, parameter "
+                                f"{nv['a']:.6g}; fit to the joint-move curve within "
+                                f"{nv['fit_error']:.1%}"
+                              + f"\n        slope vs own curve at current {at1:+.0%}, "
+                                f"within +/-20% of current pressure {lo:+.0%} to "
+                                f"{hi:+.0%}")
+                    print(f"    native curves add up to the group's response within "
+                          f"{oc['additivity_gap']:.1%} when all campaigns move "
+                          f"together\n      ({oc['additivity_at_current']:+.1%} at "
+                          f"current spend)")
                 sh = oc['increments_share_of_pooled']
                 how = ("less: on a saturating curve they compete for the same "
                        "headroom" if sh < 0.995 else
