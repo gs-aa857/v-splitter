@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import os
 import shutil
 import sys
 import warnings
@@ -3437,7 +3438,128 @@ def _row_styles(ws, row_idx: int, n_cols: int) -> list[dict]:
 
 
 PLATFORM_STRUCTURE_SHEET = "Structure"
+_STRUCTURE_REBUILT = False         # set by write_output for verify_written
 ORIGINAL_STRUCTURE_SHEET = "Structure (original)"
+
+
+def empty_text_cells(path) -> dict[str, dict[str, str]]:
+    """
+    {sheet: {cell: kind}} of every cell the file stores as EMPTY TEXT; kind
+    'text' reads back as '' (<is><t></t></is>, or an empty shared string),
+    'blank' as null (<c t="inlineStr"/>).
+
+    The platform writes the empty cells of its tables as empty text
+    (<c t="inlineStr"/>), not as missing cells. openpyxl reads both as None
+    and so, on saving, drops the empty-text ones -- a change no value check
+    sees, but readers do: polars/calamine (the budget optimiser) reads empty
+    text as '' and a missing cell as null. In 'Structure' that difference
+    decides how the optimiser handles the Lag column, so the file has to
+    keep them exactly.
+    """
+    import re
+    import zipfile
+    out = {}
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        wbx = z.read("xl/workbook.xml").decode("utf8")
+        rels = z.read("xl/_rels/workbook.xml.rels").decode("utf8")
+        target = {}
+        for m in re.finditer(r"<Relationship\b[^>]*>", rels):
+            tag = m.group(0)
+            rid = re.search(r'Id="([^"]+)"', tag)
+            tg = re.search(r'Target="([^"]+)"', tag)
+            if rid and tg:
+                t = tg.group(1).lstrip("/")
+                target[rid.group(1)] = t if t.startswith("xl/") else "xl/" + t
+        empty_shared = set()
+        if "xl/sharedStrings.xml" in names:
+            sst = z.read("xl/sharedStrings.xml").decode("utf8")
+            for i, si in enumerate(re.findall(r"<si>(.*?)</si>|<si/>", sst, re.S)):
+                if not re.sub(r"<[^>]+>", "", si or ""):
+                    empty_shared.add(str(i))
+        cell_re = re.compile(
+            r'<c r="([A-Z]+\d+)"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+        for m in re.finditer(r"<sheet\b[^>]*>", wbx):
+            tag = m.group(0)
+            nm = re.search(r'name="([^"]*)"', tag)
+            rid = re.search(r'r:id="([^"]+)"', tag)
+            if not nm or not rid or target.get(rid.group(1)) not in names:
+                continue
+            x = z.read(target[rid.group(1)]).decode("utf8")
+            if 't="inlineStr"' not in x and 't="s"' not in x:
+                continue
+            cells = {}
+            for c in cell_re.finditer(x):
+                attrs, body = c.group(2), c.group(3) or ""
+                if 't="inlineStr"' in attrs and not re.sub(r"<[^>]+>", "", body):
+                    cells[c.group(1)] = "text" if "<t" in body else "blank"
+                elif 't="s"' in attrs:
+                    v = re.search(r"<v>(\d+)</v>", body)
+                    if v and v.group(1) in empty_shared:
+                        cells[c.group(1)] = "text"
+            if cells:
+                from xml.sax.saxutils import unescape
+                out[unescape(nm.group(1))] = cells
+    return out
+
+
+def empty_text_mode(cells: dict) -> str:
+    """How a sheet writes its empty cells: 'text' if any read back as ''."""
+    return "text" if any(k == "text" for k in cells.values()) else "blank"
+
+
+def write_empty_text(path, sheet_modes: dict) -> None:
+    """
+    openpyxl saves an empty string as <c t="inlineStr"></c>, which readers
+    take as a missing cell. For every sheet whose source wrote readable empty
+    text, rewrite those cells as <c t="inlineStr"><is><t></t></is></c>, as the
+    platform does, so polars/calamine reads '' exactly as it does from a
+    platform export.
+    """
+    import re
+    import zipfile
+    want = {n for n, m in sheet_modes.items() if m == "text"}
+    if not want:
+        return
+    with zipfile.ZipFile(path) as z:
+        wbx = z.read("xl/workbook.xml").decode("utf8")
+        rels = z.read("xl/_rels/workbook.xml.rels").decode("utf8")
+        target = {}
+        for m in re.finditer(r"<Relationship\b[^>]*>", rels):
+            tag = m.group(0)
+            rid = re.search(r'Id="([^"]+)"', tag)
+            tg = re.search(r'Target="([^"]+)"', tag)
+            if rid and tg:
+                t = tg.group(1).lstrip("/")
+                target[rid.group(1)] = t if t.startswith("xl/") else "xl/" + t
+        from xml.sax.saxutils import unescape
+        files = set()
+        for m in re.finditer(r"<sheet\b[^>]*>", wbx):
+            nm = re.search(r'name="([^"]*)"', m.group(0))
+            rid = re.search(r'r:id="([^"]+)"', m.group(0))
+            if nm and rid and unescape(nm.group(1)) in want:
+                files.add(target.get(rid.group(1)))
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    pat = re.compile(rb'(<c r="[A-Z]+\d+"[^>]*?t="inlineStr"[^>]*?)(?:/>|></c>)')
+    tmp = Path(str(path) + ".tmp")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            if info.filename in files:
+                data = pat.sub(rb"\1><is><t></t></is></c>", data)
+            out.writestr(info, data)
+    os.replace(tmp, path)
+
+
+def restore_empty_text(wb, empties: dict, skip: set) -> None:
+    """Put back the source's empty-text cells (see empty_text_cells) on
+    every sheet that is carried over rather than rewritten from data."""
+    for name, cells in empties.items():
+        if name in skip or name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        for co in cells:
+            if ws[co].value is None:
+                ws[co].value = ""
 
 
 def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
@@ -3469,6 +3591,7 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
     wb._sheets.remove(new)
     wb._sheets.insert(idx, new)
     new.sheet_view.tabSelected = False
+    old.sheet_view.tabSelected = False
 
     # column positions from the sub-header row (the one holding 'Decay')
     hdr_row, cols = None, {}
@@ -3496,6 +3619,7 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
         if r0 is None or not rows:
             continue
         template = [new.cell(r0, c) for c in range(1, n_cols + 1)]
+        empty_text = any(t.value == "" for t in template)
 
         def _f(v):
             try:
@@ -3532,6 +3656,13 @@ def rebuild_platform_structure(wb, rows_by_pooled: dict) -> dict:
                 new.cell(r, c_roi).value = row.get("roi")
             if c_cpu:
                 new.cell(r, c_cpu).value = row.get("cpu")
+            # The platform writes an empty cell of this table as empty TEXT,
+            # not as a missing cell, and readers tell them apart (the budget
+            # optimiser does: see restore_empty_text).
+            if empty_text:
+                for c in range(1, n_cols + 1):
+                    if new.cell(r, c).value is None:
+                        new.cell(r, c).value = ""
         done.append(pooled)
     return {"rebuilt": True, "variables": done}
 
@@ -3665,6 +3796,18 @@ def write_output(
         shutil.copy2(source_path, tmp_path)
 
         wb = load_workbook(tmp_path)
+        # Carried-over sheets keep the platform's empty-text cells, which
+        # openpyxl would otherwise drop on saving.
+        empties = empty_text_cells(source_path)
+        restore_empty_text(wb, empties,
+                           skip=set(updates) - {PLATFORM_STRUCTURE_SHEET})
+        sheet_modes = {n: empty_text_mode(c) for n, c in empties.items()}
+        # sheets the tool creates follow the platform's own convention, read
+        # from the source's 'Structure' (the curve sheets when built, the
+        # rebuilt Structure and the renamed original)
+        house = sheet_modes.get(PLATFORM_STRUCTURE_SHEET, "blank")
+        for n in (CURVES_SHEET, ROI_CURVES_SHEET, ORIGINAL_STRUCTURE_SHEET):
+            sheet_modes.setdefault(n, house)
         # Sheets built from scratch (the curve sheets of an export without
         # them) are created next to where the platform puts them.
         for name, before in (new_sheets or {}).items():
@@ -3689,9 +3832,13 @@ def write_output(
                          allow_column_change=name in column_change_sheets)
             if name in (CURVES_SHEET, ROI_CURVES_SHEET):
                 _platform_curve_format(wb[name], name)
+        global _STRUCTURE_REBUILT
+        _STRUCTURE_REBUILT = False
         if platform_structure_rows:
-            rebuild_platform_structure(wb, platform_structure_rows)
+            _STRUCTURE_REBUILT = bool(rebuild_platform_structure(
+                wb, platform_structure_rows).get("rebuilt"))
         wb.save(tmp_path)
+        write_empty_text(tmp_path, sheet_modes)
 
         # The written file must actually differ from the source. If it does
         # not, the edits silently did nothing and shipping it would be worse
@@ -3734,9 +3881,8 @@ def verify_written(dest_path: Path, source_path: Path,
     original = pd.read_excel(source_path, sheet_name=None)
 
     result = {"file": str(dest_path), "sheets": {}}
-    rebuilt = ORIGINAL_STRUCTURE_SHEET in written and \
-        ORIGINAL_STRUCTURE_SHEET not in original
-    if rebuilt:
+    rebuilt = _STRUCTURE_REBUILT and PLATFORM_STRUCTURE_SHEET in written
+    if rebuilt and ORIGINAL_STRUCTURE_SHEET in written:
         original = dict(original)
         original[ORIGINAL_STRUCTURE_SHEET] = original.get(PLATFORM_STRUCTURE_SHEET)
     for name in written:
