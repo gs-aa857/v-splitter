@@ -222,6 +222,16 @@ CURVE_STEPS = 350
 #     }
 COMPOSITE_COLUMNS: dict[str, list[str]] = {}
 
+
+# Platform split segments ('… (Split1)', '…_Split2'): the period each one
+# covers. Their campaigns are the combined variable's parts, set to 0 outside
+# it. The app fills this in from the segment's own Raw series; None = open end.
+#
+#     SEGMENT_WINDOWS = {
+#         "M-Channel_Inv_Campaign2 (Split1)": ["2023-08-21", "2024-12-31"],
+#     }
+SEGMENT_WINDOWS: dict[str, list] = {}
+
 # CURVE_MODE can also be set per variable, which matters when a model mixes
 # volume-based and spend-based pooled variables:
 #

@@ -55,13 +55,13 @@ _RUN_LOCK = threading.Lock()
 # file lacks 'T structure'), and that must not leak into the next run.
 _GLOBALS = ("SPLITS", "STRUCTURE_SHEET", "DECAY_IS_RETENTION", "CURVE_MODE",
             "ACCEPT_TRANSFORM_MISMATCH", "ACCEPT_RAW_MISMATCH", "SMOOTHING",
-            "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS")
+            "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS", "SEGMENT_WINDOWS")
 CONFIG_DEFAULTS = {k: copy.deepcopy(getattr(CFG, k, {})) for k in _GLOBALS}
 
 # Per-job settings the app now asks for itself. If config.py still carries
 # values for these they are ignored by the app, and the UI says so.
 PER_JOB = ("ACCEPT_TRANSFORM_MISMATCH", "ACCEPT_RAW_MISMATCH", "SMOOTHING",
-           "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS")
+           "RESCALE_TO_POOLED", "COMPOSITE_COLUMNS", "SEGMENT_WINDOWS")
 
 SPEND_TOKENS = ("Inv", "Spend", "Cost")
 COMPOSITE_SHEET = "Composite data"
@@ -281,6 +281,148 @@ class Prefill:
     # columns that are not on DATA but are built as sums of DATA columns:
     # a nested composite kept whole as one campaign (and its spend)
     virtual: dict[str, list[str]] = field(default_factory=dict)
+    # a platform split segment: the period its campaign columns are cut to
+    # (None at an end that runs to the edge of the data)
+    window: tuple | None = None
+    suffix: str = ""
+
+
+# ---------------------------------------------------------------------------
+#  Split segments and the parts search
+# ---------------------------------------------------------------------------
+
+_SPLIT = re.compile(r"^(?P<base>.+?)(?P<suffix>\s*\(Split\d+\)|_Split\d+)\s*$")
+
+
+def split_base(name: str) -> tuple[str | None, str]:
+    """'M-X (Split1)' -> ('M-X', ' (Split1)'); 'M-X_Split2' -> ('M-X', '_Split2');
+    (None, '') for a name that is not a platform split."""
+    m = _SPLIT.match(str(name))
+    return (m.group("base"), m.group("suffix")) if m else (None, "")
+
+
+def segment_window(series: pd.Series | None) -> tuple | None:
+    """
+    The period a split segment covers, from its own Raw series: first to last
+    non-zero day. Where the cut really falls inside an off stretch does not
+    matter -- the variable is zero there either way. An end that touches the
+    edge of the data is left open (None), so carry-over from before the model
+    start still counts for a first segment.
+    """
+    if series is None or series.empty:
+        return None
+    v = pd.to_numeric(series, errors="coerce").fillna(0.0).sort_index()
+    nz = v[v != 0]
+    if nz.empty:
+        return None
+    lo, hi = nz.index.min(), nz.index.max()
+    return (None if lo <= v.index.min() else lo,
+            None if hi >= v.index.max() else hi)
+
+
+def active_outside(col: str, data: pd.DataFrame | None, window) -> bool:
+    """Whether a DATA column has any non-zero value outside a segment's
+    period. Unknown (no data, no column, no window) counts as yes."""
+    if data is None or not col or col not in data.columns or not window:
+        return True
+    lo, hi = window
+    idx = data.index
+    out = np.zeros(len(idx), dtype=bool)
+    if lo is not None:
+        out |= np.asarray(idx < pd.Timestamp(lo))
+    if hi is not None:
+        out |= np.asarray(idx > pd.Timestamp(hi))
+    x = pd.to_numeric(data[col], errors="coerce").fillna(0.0).to_numpy()
+    return bool((x[out] != 0).any())
+
+
+def segment_name(raw: str, spend: str, data, window, suffix: str) -> str:
+    """
+    A split segment's campaign keeps the segment's suffix only where it is
+    needed to tell the two apart: if the column also ran outside the
+    segment's period, cutting it gives a different series, and it is named
+    '<column> (Split1)'. If it ran only inside, the cut column IS the column,
+    and it keeps its plain name.
+    """
+    if not suffix or not raw:
+        return raw
+    if active_outside(raw, data, window) or \
+            (spend and spend != raw and active_outside(spend, data, window)):
+        return f"{raw}{suffix}"
+    return raw
+
+
+def search_parts(target: pd.Series, data: pd.DataFrame, data_cols: list[str],
+                 metric: str, window: tuple | None = None,
+                 exclude: set | None = None) -> tuple[list[str] | None, str]:
+    """
+    The DATA columns that add up exactly to `target`, each used once.
+
+    Not a search through combinations: one non-negative least-squares solve
+    (milliseconds, also for dozens of candidates), then checks.
+      candidates  media columns of the same metric type, active inside the
+                  window, never above the target (parts of a plain sum cannot be)
+      accepted    only if the solve reproduces the target exactly, every weight
+                  is 0 or 1, at least two columns are used, and NO other exact
+                  solution exists -- tested by re-solving without each chosen
+                  column in turn. Anything else returns None and a reason; the
+                  user fills the table in.
+    """
+    from scipy.optimize import nnls
+    y = pd.to_numeric(target, errors="coerce").fillna(0.0).sort_index()
+    if window:
+        lo, hi = window
+        keep = pd.Series(True, index=y.index)
+        if lo is not None:
+            keep &= y.index >= pd.Timestamp(lo)
+        if hi is not None:
+            keep &= y.index <= pd.Timestamp(hi)
+        y = y[keep]
+    if y.empty or not (y != 0).any() or data is None:
+        return None, "no activity to match"
+    X = data.reindex(y.index)
+    tol = 1e-6 * float(np.abs(y).max()) + 1e-9
+    cands, alone = [], []
+    for c in data_cols:
+        if c in (exclude or set()) or not str(c).startswith("M-") \
+                or split_name(c)[1] != metric or c not in X.columns:
+            continue
+        x = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+        if not (x > tol).any() or (x > y + tol).any() or (x < -tol).any():
+            continue
+        if float(np.abs(x - y).max()) <= tol:
+            alone.append(c)                       # the variable itself, renamed
+            continue
+        cands.append(c)
+    if len(cands) < 2:
+        return None, (f"matches {alone[0]!r} on its own, which is the variable "
+                      f"itself rather than its parts" if alone else
+                      f"only {len(cands)} '{metric}' column(s) fit inside it")
+    A = X[cands].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy()
+    b = y.to_numpy()
+
+    def solve(cols_idx):
+        w, _ = nnls(A[:, cols_idx], b)
+        exact = float(np.abs(A[:, cols_idx] @ w - b).max()) <= tol
+        return w, exact
+
+    w, exact = solve(list(range(len(cands))))
+    if not exact:
+        return None, (f"no set of the {len(cands)} '{metric}' columns that fit "
+                      f"inside it adds up to it exactly")
+    if not all(abs(v) < 1e-6 or abs(v - 1) < 1e-6 for v in w):
+        return None, "only a weighted combination fits, not a plain sum"
+    chosen = [i for i, v in enumerate(w) if v > 0.5]
+    if len(chosen) < 2:
+        return None, "only one column fits"
+    for j in chosen:
+        rest = [i for i in range(len(cands)) if i != j]
+        if rest and solve(rest)[1]:
+            return None, (f"more than one set of columns adds up to it exactly "
+                          f"(for example without {cands[j]!r}); choose the parts "
+                          f"by hand")
+    return [cands[i] for i in chosen], (f"the only exact sum among {len(cands)} "
+                                        f"'{metric}' columns")
 
 
 def _spend_name(part: str, taken) -> str:
@@ -379,51 +521,27 @@ def from_composite(pooled: str, composites: dict, data_cols: list[str],
 
 def from_sum_match(pooled: str, pooled_raw: pd.Series | None,
                    data: pd.DataFrame | None, data_cols: list[str],
-                   max_candidates: int = 16) -> Prefill:
-    """Find same-channel, same-metric DATA columns that sum to the pooled Raw."""
-    pf = Prefill(pooled, "none")
-    cands = likely_columns(data_cols, pooled)
-    if pooled_raw is None or data is None or len(cands) < 2:
+                   window: tuple | None = None, suffix: str = "") -> Prefill:
+    """Find the same-metric DATA columns that add up exactly to the pooled
+    Raw series (see search_parts). For a split segment, only inside its
+    window, and the campaigns are named with the segment's suffix."""
+    pf = Prefill(pooled, "none", window=window, suffix=suffix)
+    if pooled_raw is None or data is None:
         return pf
-    if len(cands) > max_candidates:
-        pf.notes.append(f"{len(cands)} candidate columns -- too many to search "
-                        f"for a matching sum; fill in by hand.")
+    metric = split_name(split_base(pooled)[0] or pooled)[1]
+    parts, why = search_parts(pooled_raw, data, data_cols, metric, window,
+                              exclude={pooled})
+    if parts is None:
+        pf.notes.append(f"No parts found automatically: {why}.")
         return pf
-
-    X = data.reindex(pooled_raw.index)[cands].apply(
-        pd.to_numeric, errors="coerce").fillna(0.0)
-    y = pooled_raw.astype(float).to_numpy()
-    if X.empty or not np.isfinite(y).all():
-        return pf
-    Xv = X.to_numpy()
-    totals = Xv.sum(axis=0)
-    target = y.sum()
-    tol_total = max(1e-6 * abs(target), 1e-9)
-    tol_day = max(1e-6 * float(np.abs(y).max()), 1e-9)
-
-    matches = []
-    for k in range(2, len(cands) + 1):
-        for combo in itertools.combinations(range(len(cands)), k):
-            if abs(totals[list(combo)].sum() - target) > tol_total:
-                continue
-            if np.abs(Xv[:, combo].sum(axis=1) - y).max() <= tol_day:
-                matches.append(combo)
-    if not matches:
-        return pf
-    # all-zero columns make otherwise-identical matches; prefer the one without
-    nonzero = [m for m in matches if all(totals[i] != 0 for i in m)]
-    best = (nonzero or matches)[0]
     pf.source = "sum-match"
-    pf.rows = [{"name": cands[i], "raw": cands[i],
-                "spend": guess_spend(cands[i], data_cols)} for i in best]
-    if len(nonzero or matches) > 1:
-        pf.notes.append(f"{len(nonzero or matches)} different column sets sum "
-                        f"to this variable; the first was pre-filled. Check it.")
-    missing = [r["name"] for r in pf.rows if not r["spend"]]
+    pf.rows = [{"name": c, "raw": c,
+                "spend": guess_spend(c, data_cols)} for c in parts]
+    pf.notes.append(f"Parts found automatically: {why}.")
+    missing = [r["raw"] for r in pf.rows if not r["spend"]]
     if missing:
         pf.notes.append(f"No unambiguous spend column for: {', '.join(missing)}.")
     return pf
-
 
 # ---------------------------------------------------------------------------
 #  Inspection: everything the UI needs from the two files, in one locked call
@@ -489,6 +607,47 @@ def inspect(files) -> RunResult:
 
 
 def prefill(pooled: str, ins: Inspection, expand_nested: bool = False) -> Prefill:
+    base, suffix = split_base(pooled)
+    if base is not None and pooled not in ins.data_cols:
+        return _prefill_segment(pooled, base, suffix, ins, expand_nested)
+    return _prefill_plain(pooled, ins, expand_nested)
+
+
+def _prefill_segment(pooled, base, suffix, ins, expand_nested) -> Prefill:
+    """
+    A platform split segment ('… (Split1)', '…_Split2'). Its campaigns are its
+    parts cut to the segment's period; the cut is set whether or not the
+    parts are found, so it also applies to rows filled in by hand.
+    """
+    window = segment_window(ins.pooled_raw.get(pooled))
+    if base in ins.composites:
+        pf = from_composite(base, ins.composites, ins.data_cols,
+                            model_raw_cols=ins.model_raw_cols,
+                            expand_nested=expand_nested)
+        pf.pooled, pf.window, pf.suffix = pooled, window, suffix
+        if pf.source != "none":
+            _name_segment_rows(pf, ins.data)
+            return pf
+    pf = from_sum_match(pooled, ins.pooled_raw.get(pooled), ins.data,
+                        ins.data_cols, window=window, suffix=suffix)
+    _name_segment_rows(pf, ins.data)
+    pf.notes.insert(0, f"'{pooled}' is a split segment of '{base}'. Its campaign "
+                       f"columns are cut to the segment's period.")
+    if pf.source == "none":
+        pf.notes.append("Fill in the parts of the combined variable by hand -- "
+                        "the full columns; the tool cuts them to the segment.")
+    return pf
+
+
+def _name_segment_rows(pf: Prefill, data) -> None:
+    """Segment suffix only where a campaign would otherwise be
+    indistinguishable from its full column (see segment_name)."""
+    for r in pf.rows:
+        r["name"] = (segment_name(r["raw"], r["spend"], data, pf.window, pf.suffix)
+                     if r.get("raw") else f"{r['name']}{pf.suffix}")
+
+
+def _prefill_plain(pooled: str, ins: Inspection, expand_nested: bool) -> Prefill:
     if pooled in ins.composites:
         pf = from_composite(pooled, ins.composites, ins.data_cols,
                             model_raw_cols=ins.model_raw_cols,
@@ -506,7 +665,6 @@ def prefill(pooled: str, ins: Inspection, expand_nested: bool = False) -> Prefil
     pf = from_sum_match(pooled, ins.pooled_raw.get(pooled), ins.data,
                         ins.data_cols)
     if pf.source == "none" and not pf.notes:
-        pf.notes.append("Not in 'Composite data' and no set of same-channel, "
-                        "same-metric DATA columns sums to it. Combined outside "
-                        "the platform -- fill the campaigns in by hand.")
+        pf.notes.append("Not in 'Composite data'. Combined outside the "
+                        "platform -- fill the campaigns in by hand.")
     return pf

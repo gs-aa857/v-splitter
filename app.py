@@ -90,7 +90,7 @@ def config_text(settings: dict) -> str:
            ""]
     for k in ("DECAY_IS_RETENTION", "CURVE_MODE", "ACCEPT_TRANSFORM_MISMATCH",
               "ACCEPT_RAW_MISMATCH", "SMOOTHING", "RESCALE_TO_POOLED",
-              "COMPOSITE_COLUMNS"):
+              "COMPOSITE_COLUMNS", "SEGMENT_WINDOWS"):
         out.append(f"{k} = {settings.get(k, S.CONFIG_DEFAULTS[k])!r}")
     out += ["", "SPLITS = ["]
     for sp in settings["SPLITS"]:
@@ -238,6 +238,8 @@ selected = st.multiselect(
 splits: list[Split] = []
 curve_modes, smoothing, acc_transform, acc_raw, rescale = {}, {}, {}, {}, {}
 composite_cols: dict[str, list[str]] = {}
+segment_windows: dict[str, list] = {}
+all_campaign_names: set[str] = set()
 problems: list[str] = []
 
 for pooled in selected:
@@ -258,12 +260,24 @@ for pooled in selected:
         st.subheader(pooled)
         st.caption({
             "composite": f"Pre-filled from the formula `{pf.formula}`.",
-            "sum-match": "Pre-filled: these DATA columns sum exactly to the "
-                         "pooled variable's Raw series.",
+            "sum-match": "Pre-filled: these DATA columns add up exactly to the "
+                         "pooled variable's Raw series (for a split segment, "
+                         "inside its period), and no other set does.",
             "none": "Nothing to pre-fill from. Add one row per campaign.",
         }[pf.source])
         for n in pf.notes:
             st.info(n)
+        seg_base, seg_suffix = S.split_base(pooled)
+        is_segment = seg_base is not None and pooled not in ins.data_cols
+        if is_segment and pf.window:
+            lo, hi = pf.window
+            segment_windows[pooled] = [lo.strftime("%Y-%m-%d") if lo is not None else None,
+                                       hi.strftime("%Y-%m-%d") if hi is not None else None]
+            st.caption(f"Split segment: every campaign column below -- metric and "
+                       f"spend, pre-filled or added by hand -- is set to 0 outside "
+                       f"{segment_windows[pooled][0] or 'the start'} .. "
+                       f"{segment_windows[pooled][1] or 'the end'}. Enter the full "
+                       f"columns; the cut is applied for you.")
 
         rows = [{k: (v or None) for k, v in r.items()} for r in pf.rows] \
             or [{"name": None, "raw": None, "spend": None}] * 2
@@ -298,7 +312,9 @@ for pooled in selected:
             if not raw or not sp:
                 bad.append(f"row {i + 1} needs both a metric and a spend column")
                 continue
-            camps.append(Campaign(nm or raw, raw, sp))
+            camps.append(Campaign(
+                nm or (S.segment_name(raw, sp, ins.data, pf.window, seg_suffix)
+                       if is_segment else raw), raw, sp))
         names = [c.name for c in camps]
         if len(camps) < 2:
             bad.append("at least two campaigns are needed")
@@ -306,6 +322,15 @@ for pooled in selected:
             bad.append("two campaigns have the same name")
         if pooled in names:
             bad.append("a campaign has the pooled variable's own name")
+        clash = [n for n in names if n in ins.variables and n != pooled]
+        if clash:
+            bad.append(f"{', '.join(repr(n) for n in clash)} is already a variable "
+                       f"in the model -- give the campaign another name")
+        taken_elsewhere = [n for n in names if n in all_campaign_names]
+        if taken_elsewhere:
+            bad.append(f"{', '.join(repr(n) for n in taken_elsewhere)} is also a "
+                       f"campaign of another variable being split")
+        all_campaign_names.update(names)
         raws = [c.raw for c in camps]
         if len(set(raws)) != len(raws):
             bad.append("the same metric column is used twice")
@@ -427,6 +452,7 @@ settings = {
     "SMOOTHING": smoothing,
     "RESCALE_TO_POOLED": rescale,
     "COMPOSITE_COLUMNS": composite_cols,
+    "SEGMENT_WINDOWS": segment_windows,
 }
 fingerprint = _digest(file_key, repr(settings))
 

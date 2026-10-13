@@ -55,6 +55,7 @@ try:
     BUILD_MISSING_CURVES = getattr(_config_module, "BUILD_MISSING_CURVES", True)
     CURVE_STEPS = int(getattr(_config_module, "CURVE_STEPS", 350))
     COMPOSITE_COLUMNS = dict(getattr(_config_module, "COMPOSITE_COLUMNS", {}))
+    SEGMENT_WINDOWS = dict(getattr(_config_module, "SEGMENT_WINDOWS", {}))
 except ImportError as _err:
     # An older config.py alongside a newer mmm_splitter.py. The two are a
     # matched pair; updating one without the other is the most common way this
@@ -121,6 +122,30 @@ INTERFACE = "cli"
 
 def _hint(cli: str, app: str) -> str:
     return app if INTERFACE == "app" else cli
+
+
+def cut_to_segment(data: pd.DataFrame, split, window, date_col: str):
+    """
+    A platform split segment is its combined variable switched on for one
+    period only, so its campaigns are their full DATA columns switched off
+    outside that period. Returns a copy of DATA with this split's campaign
+    metric and spend columns set to 0 outside the window, and how many
+    periods were cut. window = (start, end); None at an open end.
+    """
+    if not window:
+        return data, 0
+    lo, hi = window
+    d = pd.to_datetime(data[date_col])
+    outside = pd.Series(False, index=data.index)
+    if lo is not None:
+        outside |= d < pd.Timestamp(lo)
+    if hi is not None:
+        outside |= d > pd.Timestamp(hi)
+    out = data.copy()
+    for c in {col for camp in split.campaigns for col in (camp.raw, camp.spend)}:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+        out.loc[outside, c] = 0.0
+    return out, int(outside.sum())
 
 
 def add_composite_columns(data: pd.DataFrame, spec: dict) -> tuple[pd.DataFrame, dict]:
@@ -4184,9 +4209,40 @@ def cmd_split(args) -> int:
     failures: list[str] = []
     accepted: list[tuple[str, str, float]] = []
 
+    # Every new variable name must be new: not a variable the model already
+    # has, and not a campaign of another split in the same run. Two variables
+    # of one name would be merged or overwritten by whatever reads the file.
+    model_vars = {str(v).strip() for v in inp.model_variables}
+    pooled_all = {sp.pooled.strip() for sp in SPLITS}
+    seen, clashes = {}, []
+    for sp in SPLITS:
+        for c in sp.campaigns:
+            n = c.name.strip()
+            if n in model_vars and n not in pooled_all:
+                clashes.append(f"'{c.name}' ({sp.pooled}) is already a variable "
+                               f"in the model")
+            if n in seen and seen[n] != sp.pooled:
+                clashes.append(f"'{c.name}' is a campaign of both '{seen[n]}' and "
+                               f"'{sp.pooled}'")
+            seen.setdefault(n, sp.pooled)
+    if clashes:
+        print("\nSTOPPED. Campaign names must be new and unique:\n  "
+              + "\n  ".join(clashes))
+        return 1
+
+    data_full = data
     for split in SPLITS:
         print(f"\n{'#' * 72}\n# {split.pooled} -> {', '.join(split.names)}\n{'#' * 72}")
-        split.validate(list(data.columns))
+        split.validate(list(data_full.columns))
+        # A platform split segment: its campaigns are cut to its period.
+        window = SEGMENT_WINDOWS.get(split.pooled)
+        data, n_cut = cut_to_segment(data_full, split, window, date_col)
+        if window:
+            lo, hi = window
+            a_ = f"{pd.Timestamp(lo):%Y-%m-%d}" if lo else "the start"
+            b_ = f"{pd.Timestamp(hi):%Y-%m-%d}" if hi else "the end"
+            print(f"  split segment: campaign columns cut to {a_} .. {b_} "
+                  f"({n_cut} period(s) outside set to 0)")
         hits = scan_workbook(args.output_file, split.pooled)
         print(scan_report(args.output_file, split.pooled,
                                 handled=handled, skipped=UNTOUCHED))
@@ -4647,6 +4703,7 @@ def cmd_split(args) -> int:
         else:
             print("  no ROI or CPU column on this sheet -- nothing to recompute")
 
+    data = data_full
     if failures:
         print("\n" + "=" * 72)
         print(f"STOPPED. Nothing was written.")
